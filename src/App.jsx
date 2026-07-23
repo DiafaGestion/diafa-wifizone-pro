@@ -1,0 +1,2963 @@
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import Papa from "papaparse";
+import * as XLSX from "xlsx";
+import {
+  LayoutDashboard, UploadCloud, Users, Tag, CalendarRange, Wifi, Moon, Sun,
+  Bell, ChevronDown, Plus, Pencil, Trash2, Search, Lock, LockOpen, TrendingUp,
+  TrendingDown, Ticket, FileSpreadsheet, CheckCircle2, AlertTriangle, X,
+  ArrowUpRight, ArrowDownRight, Save, Menu, Maximize2, RefreshCw, Database,
+  ShieldCheck, Activity as ActivityIcon, BarChart3, Trophy, Award, Download, Share2
+} from "lucide-react";
+import {
+  LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, PieChart, Pie, Cell, BarChart, Bar
+} from "recharts";
+
+/* ---------------------------------------------------------------------- */
+/* DIAFA WIFIZONE PRO — Phase 1 prototype                                  */
+/* Import CSV · Revendeurs · Tarifs · Dashboard · Rapport Hebdomadaire     */
+/* Palette from the client's own cahier des charges — not a design choice */
+/* ---------------------------------------------------------------------- */
+
+const COLORS = {
+  primary: "#2563EB",
+  secondary: "#10B981",
+  accent: "#F59E0B",
+  danger: "#EF4444",
+  bgLight: "#F8FAFC",
+  textLight: "#1E293B",
+  bgDark: "#0F172A",
+  panelDark: "#1E293B",
+  textDark: "#E2E8F0",
+};
+
+const GNF = (n) =>
+  (Math.round(n || 0)).toLocaleString("fr-FR").replace(/,/g, " ") + " GNF";
+
+const fmtInt = (n) => (n || 0).toLocaleString("fr-FR").replace(/,/g, " ");
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+/* ---- Mikhmon date parsing: "jul/23/2026" "00:02:30" ------------------- */
+const MONTHS = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
+function parseMikhmonDate(dateStr, timeStr) {
+  if (!dateStr) return null;
+  const m = dateStr.trim().toLowerCase().match(/^([a-z]{3})\/(\d{1,2})\/(\d{4})$/);
+  if (!m) return null;
+  const mon = MONTHS[m[1]];
+  if (mon === undefined) return null;
+  const [h, mi, s] = (timeStr || "00:00:00").split(":").map((x) => parseInt(x, 10) || 0);
+  return new Date(parseInt(m[3], 10), mon, parseInt(m[2], 10), h, mi, s || 0);
+}
+function dateKey(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/* ---- profile -> category normalisation --------------------------------- */
+function normalizeProfile(profile) {
+  const p = (profile || "").toLowerCase();
+  if (p.includes("heure")) return "heure";
+  if (p.includes("2") && p.includes("jour")) return "deuxJours";
+  if (p.includes("semaine")) return "semaine";
+  if (p.includes("mois")) return "mois";
+  if (p.includes("jour")) return "jour";
+  return "autre";
+}
+const CAT_LABEL = { heure: "Heure", jour: "Jour", deuxJours: "2 Jours", semaine: "Semaine", mois: "Mois", autre: "Autre" };
+const DEFAULT_CAT_LABELS = { heure: "Heure", jour: "Jour", deuxJours: "2 Jours", semaine: "Semaine", mois: "Mois" };
+const DEFAULT_SETTINGS = { entreprise: "DIAFA GROUP", logo: null, adresse: "", telephone: "", email: "", devise: "GNF", langue: "Français", fuseauHoraire: "GMT+0 (Conakry)" };
+
+/* ---- default tarifs (client's refined spec) ------------------------------ */
+const DEFAULT_TARIFS = { heure: 4000, jour: 9000, deuxJours: 18000, semaine: 29000, mois: 99000 };
+
+/* ---- persistent storage helpers ----------------------------------------- */
+async function loadKey(key, fallback) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+async function saveKey(key, value) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch (e) {
+    console.error("storage save failed", key, e);
+  }
+}
+
+/* ---- one-time migration: Mikhmon's № resets per export, so older data (imported
+   before the internal globalId system) needs a stable chronological ID backfilled,
+   and already-closed weeks' ticket ranges re-derived in that new ID space. -------- */
+function migrateTicketIds(tickets, weeks) {
+  if (!tickets.length || !tickets.some((t) => t.globalId == null)) {
+    return { tickets, weeks };
+  }
+  const sorted = tickets.slice().sort((a, b) => {
+    const da = parseMikhmonDate(a.date, a.time), db = parseMikhmonDate(b.date, b.time);
+    if (da && db && da.getTime() !== db.getTime()) return da - db;
+    return (a.num || 0) - (b.num || 0);
+  });
+  const migratedTickets = sorted.map((t, i) => ({ ...t, globalId: i + 1 }));
+
+  // Weeks were closed sequentially, each consuming exactly `totalTickets` tickets in
+  // chronological order — so cumulative counts alone reconstruct correct boundaries.
+  let running = 0;
+  const migratedWeeks = weeks.map((w) => {
+    const startTicket = running + 1;
+    running += w.totalTickets || 0;
+    return { ...w, startTicket, endTicket: running };
+  });
+
+  return { tickets: migratedTickets, weeks: migratedWeeks };
+}
+
+/* ------------------------------------------------------------------------ */
+
+export default function App() {
+  const [dark, setDark] = useState(false);
+  const [page, setPage] = useState("dashboard");
+  const [isMobile, setIsMobile] = useState(typeof window !== "undefined" ? window.innerWidth < 860 : false);
+  const [sidebarOpen, setSidebarOpen] = useState(typeof window !== "undefined" ? window.innerWidth >= 860 : true);
+  const [loaded, setLoaded] = useState(false);
+
+  const [revendeurs, setRevendeurs] = useState([]);
+  const [tarifs, setTarifs] = useState(DEFAULT_TARIFS);
+  const [catLabels, setCatLabels] = useState(DEFAULT_CAT_LABELS);
+  const [tickets, setTickets] = useState([]);
+  const [weeks, setWeeks] = useState([]);
+  const [meta, setMeta] = useState({ lastImportFile: null, lastImportDate: null, lastImportCount: 0 });
+  const [activities, setActivities] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [sessionUserId, setSessionUserId] = useState(null);
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [toast, setToast] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const [r, t, tk, w, m, a, cl, u, sess, settingsData] = await Promise.all([
+        loadKey("diafa:revendeurs", seedRevendeurs()),
+        loadKey("diafa:tarifs", DEFAULT_TARIFS),
+        loadKey("diafa:tickets", []),
+        loadKey("diafa:weeks", []),
+        loadKey("diafa:meta", { lastImportFile: null, lastImportDate: null, lastImportCount: 0 }),
+        loadKey("diafa:activities", []),
+        loadKey("diafa:catLabels", DEFAULT_CAT_LABELS),
+        loadKey("diafa:users", seedUsers()),
+        loadKey("diafa:session", null),
+        loadKey("diafa:settings", DEFAULT_SETTINGS),
+      ]);
+      setRevendeurs(r);
+      setTarifs(t);
+      const { tickets: migratedTickets, weeks: migratedWeeks } = migrateTicketIds(tk, w);
+      setTickets(migratedTickets);
+      setWeeks(migratedWeeks);
+      setMeta(m);
+      setActivities(a);
+      setCatLabels({ ...DEFAULT_CAT_LABELS, ...cl });
+      setUsers(u);
+      setSettings({ ...DEFAULT_SETTINGS, ...settingsData });
+      // Session is only valid if that user still exists (e.g. wasn't deleted since)
+      setSessionUserId(sess && u.some((x) => x.id === sess) ? sess : null);
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => { if (loaded) saveKey("diafa:revendeurs", revendeurs); }, [revendeurs, loaded]);
+  useEffect(() => { if (loaded) saveKey("diafa:tarifs", tarifs); }, [tarifs, loaded]);
+  useEffect(() => { if (loaded) saveKey("diafa:catLabels", catLabels); }, [catLabels, loaded]);
+  useEffect(() => { if (loaded) saveKey("diafa:tickets", tickets); }, [tickets, loaded]);
+  useEffect(() => { if (loaded) saveKey("diafa:weeks", weeks); }, [weeks, loaded]);
+  useEffect(() => { if (loaded) saveKey("diafa:meta", meta); }, [meta, loaded]);
+  useEffect(() => { if (loaded) saveKey("diafa:activities", activities); }, [activities, loaded]);
+  useEffect(() => { if (loaded) saveKey("diafa:users", users); }, [users, loaded]);
+  useEffect(() => { if (loaded) saveKey("diafa:session", sessionUserId); }, [sessionUserId, loaded]);
+  useEffect(() => { if (loaded) saveKey("diafa:settings", settings); }, [settings, loaded]);
+
+  useEffect(() => {
+    function onResize() {
+      const mobile = window.innerWidth < 860;
+      setIsMobile(mobile);
+      setSidebarOpen((prev) => (mobile ? false : true));
+    }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  function goToPage(id) {
+    setPage(id);
+    if (isMobile) setSidebarOpen(false);
+  }
+
+  function showToast(text, kind = "success") {
+    setToast({ text, kind, id: uid() });
+    window.clearTimeout(showToast._t);
+    showToast._t = window.setTimeout(() => setToast(null), 3200);
+  }
+
+  function addActivity(text, sub) {
+    setActivities((prev) => [{ id: uid(), text, sub, time: Date.now() }, ...prev].slice(0, 500));
+  }
+
+  function handleRefresh() {
+    setRefreshing(true);
+    window.setTimeout(() => setRefreshing(false), 500);
+  }
+
+  const revendeurFor = useCallback(
+    (username) => {
+      const prefix = (username || "").slice(0, 2).toLowerCase();
+      return revendeurs.find((r) => r.codes.some((c) => c.toLowerCase() === prefix)) || null;
+    },
+    [revendeurs]
+  );
+
+  const lastClosedTicket = weeks.length ? Math.max(...weeks.map((w) => w.endTicket)) : 0;
+  const maxTicketNum = tickets.length ? Math.max(...tickets.map((t) => t.globalId)) : 0;
+  const openWeekTickets = useMemo(
+    () => tickets.filter((t) => t.globalId > lastClosedTicket).sort((a, b) => a.globalId - b.globalId),
+    [tickets, lastClosedTicket]
+  );
+
+  const theme = dark
+    ? { bg: COLORS.bgDark, panel: COLORS.panelDark, text: COLORS.textDark, sub: "#94A3B8", border: "#334155", card: "#1E293B" }
+    : { bg: COLORS.bgLight, panel: "#FFFFFF", text: COLORS.textLight, sub: "#64748B", border: "#E2E8F0", card: "#FFFFFF" };
+
+  const NAV = [
+    { id: "dashboard", label: "Tableau de bord", icon: LayoutDashboard },
+    { id: "import", label: "Import CSV", icon: UploadCloud },
+    { id: "revendeurs", label: "Revendeurs", icon: Users },
+    { id: "tarifs", label: "Tarifs", icon: Tag },
+    { id: "hebdo", label: "Rapport Hebdomadaire", icon: CalendarRange },
+    { id: "mensuel", label: "Rapport Mensuel", icon: FileSpreadsheet },
+    { id: "annuel", label: "Rapport Annuel", icon: BarChart3 },
+    { id: "stats", label: "Statistiques", icon: ActivityIcon },
+    { id: "classements", label: "Classements", icon: Trophy },
+    { id: "mestickets", label: "Mes Tickets", icon: Ticket },
+    { id: "exports", label: "Exports", icon: Database },
+    { id: "utilisateurs", label: "Utilisateurs", icon: Users },
+    { id: "parametres", label: "Paramètres", icon: Tag },
+    { id: "sauvegarde", label: "Sauvegarde", icon: ShieldCheck },
+    { id: "journal", label: "Journal", icon: FileSpreadsheet },
+  ];
+  const PAGES = NAV.filter((n) => !n.soon);
+
+  const currentUser = users.find((u) => u.id === sessionUserId) || null;
+  const isRevendeurRole = currentUser && currentUser.role === "revendeur";
+  // Revendeur accounts only ever see Classements — everything else is admin-only.
+  const REVENDEUR_ALLOWED_PAGES = ["classements", "mestickets"];
+  const VISIBLE_NAV = isRevendeurRole ? NAV.filter((n) => REVENDEUR_ALLOWED_PAGES.includes(n.id)) : NAV;
+  const effectivePage = isRevendeurRole ? (REVENDEUR_ALLOWED_PAGES.includes(page) ? page : "classements") : page;
+
+  function login(user) {
+    setSessionUserId(user.id);
+    setPage(user.role === "revendeur" ? "classements" : "dashboard");
+    addActivity("Connexion", `${user.nom} (${user.role === "admin" ? "Administrateur" : "Revendeur"})`);
+  }
+  function logout() {
+    addActivity("Déconnexion", currentUser ? currentUser.nom : "");
+    setSessionUserId(null);
+  }
+
+  if (!loaded) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 520, background: theme.bg, fontFamily: "Inter, 'Segoe UI', sans-serif" }}>
+        <div style={{ color: theme.sub, fontSize: 14 }}>Chargement de DIAFA WIFIZONE PRO…</div>
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return <Login theme={theme} dark={dark} users={users} onLogin={login} />;
+  }
+
+  return (
+    <div style={{ fontFamily: "Inter, 'Segoe UI', sans-serif", background: theme.bg, color: theme.text, height: "100vh", display: "flex", overflow: "hidden", position: "relative" }}>
+      <style>{`
+        * { box-sizing: border-box; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-thumb { background: ${dark ? "#334155" : "#CBD5E1"}; border-radius: 8px; }
+        .dz-btn { cursor: pointer; border: none; font-family: inherit; transition: all .15s ease; }
+        .dz-btn:active { transform: translateY(1px); }
+        .dz-card { background: ${theme.card}; border: 1px solid ${theme.border}; border-radius: 14px; }
+        .dz-nav-item { display:flex; align-items:center; gap:10px; padding:9px 14px; border-radius:10px; font-size:13.5px; font-weight:500; cursor:pointer; transition:.15s; }
+        .dz-input { width:100%; padding:9px 12px; border-radius:9px; border:1px solid ${theme.border}; background:${dark ? "#0F172A" : "#F8FAFC"}; color:${theme.text}; font-size:13.5px; font-family:inherit; outline:none; }
+        .dz-input:focus { border-color: ${COLORS.primary}; }
+        .dz-table th { text-align:left; font-size:11px; letter-spacing:.04em; text-transform:uppercase; color:${theme.sub}; font-weight:600; padding:10px 14px; border-bottom:1px solid ${theme.border}; }
+        .dz-table td { padding:11px 14px; font-size:13px; border-bottom:1px solid ${theme.border}; }
+        .dz-table tr:last-child td { border-bottom:none; }
+        .dz-fade-in { animation: dzfade .25s ease; }
+        @keyframes dzfade { from{opacity:0; transform:translateY(4px);} to{opacity:1; transform:none;} }
+        @media (max-width: 859px) {
+          .dz-topbar-sub, .dz-user-role, .dz-fullscreen-btn { display: none !important; }
+          .dz-main { padding: 14px !important; }
+          .dz-kpi { flex: 1 1 44% !important; min-width: 0 !important; }
+        }
+        @media (max-width: 480px) {
+          .dz-kpi { flex: 1 1 100% !important; }
+        }
+      `}</style>
+
+      {/* SIDEBAR */}
+      {isMobile && sidebarOpen && (
+        <div onClick={() => setSidebarOpen(false)}
+          style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,.5)", zIndex: 29 }} />
+      )}
+      <aside style={{
+        width: isMobile ? 236 : (sidebarOpen ? 236 : 0),
+        minWidth: isMobile ? 236 : (sidebarOpen ? 236 : 0),
+        overflow: "hidden",
+        background: `linear-gradient(180deg, ${COLORS.primary} 0%, #1D4ED8 100%)`,
+        color: "#fff", display: "flex", flexDirection: "column",
+        transition: isMobile ? "transform .25s ease" : "width .2s ease",
+        position: isMobile ? "fixed" : "relative",
+        top: 0, bottom: 0, left: 0, zIndex: 30,
+        transform: isMobile ? (sidebarOpen ? "translateX(0)" : "translateX(-100%)") : "none",
+      }}>
+        <div style={{ padding: "20px 18px 14px", display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ width: 34, height: 34, borderRadius: 9, background: "rgba(255,255,255,.16)", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", flexShrink: 0 }}>
+            {settings.logo ? <img src={settings.logo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : <Wifi size={18} strokeWidth={2.4} />}
+          </div>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontWeight: 800, fontSize: 14.5, lineHeight: 1.1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{settings.entreprise || "DIAFA"}</div>
+            <div style={{ fontSize: 10, letterSpacing: ".08em", opacity: .85, fontWeight: 600 }}>WIFIZONE PRO</div>
+          </div>
+        </div>
+
+        <nav style={{ padding: "10px 10px", display: "flex", flexDirection: "column", gap: 2, flex: 1, overflowY: "auto" }}>
+          {VISIBLE_NAV.map((n) => {
+            const Icon = n.icon;
+            const active = effectivePage === n.id;
+            return (
+              <div key={n.id} className="dz-nav-item"
+                onClick={() => n.soon ? showToast(`${n.label} — module disponible en Phase 2`, "error") : goToPage(n.id)}
+                style={{
+                  background: active ? "rgba(255,255,255,.18)" : "transparent",
+                  color: n.soon ? "rgba(255,255,255,.5)" : "#fff",
+                  cursor: n.soon ? "default" : "pointer",
+                  justifyContent: "space-between",
+                }}>
+                <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <Icon size={16} strokeWidth={2.2} />
+                  <span>{n.label}</span>
+                </span>
+                {n.soon && <Lock size={11} strokeWidth={2.4} />}
+              </div>
+            );
+          })}
+        </nav>
+
+        <div style={{ margin: 12, padding: 13, borderRadius: 12, background: "rgba(255,255,255,.12)" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12.5, fontWeight: 700 }}>
+            <ShieldCheck size={14} color={COLORS.secondary} />
+            Licence active — Bêta
+          </div>
+          <div style={{ fontSize: 11, opacity: .8, marginTop: 4 }}>Module de licence : Phase 2</div>
+          <button className="dz-btn" onClick={() => showToast("Système de licence prévu pour la Phase 2", "error")}
+            style={{ marginTop: 9, width: "100%", background: "rgba(255,255,255,.16)", color: "#fff", padding: "7px 0", borderRadius: 8, fontSize: 11.5, fontWeight: 700 }}>
+            Détails licence
+          </button>
+        </div>
+      </aside>
+
+      {/* MAIN */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+        {/* TOPBAR */}
+        <header style={{
+          height: 58, minHeight: 58, display: "flex", alignItems: "center", justifyContent: "space-between",
+          padding: "0 14px", borderBottom: `1px solid ${theme.border}`, background: theme.panel,
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
+            <button className="dz-btn" onClick={() => setSidebarOpen((s) => !s)}
+              style={{ background: "transparent", color: theme.sub, padding: 6, borderRadius: 8, flexShrink: 0 }}>
+              <Menu size={18} />
+            </button>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontWeight: 700, fontSize: 15, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{NAV.find((n) => n.id === effectivePage)?.label}</div>
+              <div className="dz-topbar-sub" style={{ fontSize: 11.5, color: theme.sub }}>Bienvenue — voici votre activité.</div>
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <button className="dz-btn" onClick={handleRefresh}
+              title="Actualiser"
+              style={{ background: "transparent", color: theme.sub, width: 32, height: 32, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <RefreshCw size={15} style={{ transform: refreshing ? "rotate(360deg)" : "none", transition: "transform .5s ease" }} />
+            </button>
+            <button className="dz-btn dz-fullscreen-btn" onClick={() => document.fullscreenElement ? document.exitFullscreen?.() : document.documentElement.requestFullscreen?.()}
+              title="Plein écran"
+              style={{ background: "transparent", color: theme.sub, width: 32, height: 32, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <Maximize2 size={15} />
+            </button>
+            <button className="dz-btn" onClick={() => setDark((d) => !d)}
+              style={{ background: dark ? "#334155" : "#F1F5F9", color: theme.text, width: 32, height: 32, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              {dark ? <Sun size={15} /> : <Moon size={15} />}
+            </button>
+            {!isRevendeurRole && (
+              <div style={{ position: "relative" }} className="dz-fullscreen-btn">
+                <Bell size={17} color={theme.sub} />
+                <span style={{ position: "absolute", top: -4, right: -5, background: COLORS.danger, color: "#fff", fontSize: 9, fontWeight: 700, borderRadius: 99, padding: "1px 4px" }}>
+                  {weeks.length}
+                </span>
+              </div>
+            )}
+            <div style={{ width: 1, height: 24, background: theme.border }} className="dz-fullscreen-btn" />
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ width: 30, height: 30, borderRadius: 99, background: isRevendeurRole ? COLORS.secondary : COLORS.accent, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 700, fontSize: 12, flexShrink: 0 }}>
+                {currentUser.nom.slice(0, 2).toUpperCase()}
+              </div>
+              <div className="dz-fullscreen-btn" style={{ fontSize: 12.5 }}>
+                <div style={{ fontWeight: 600 }}>{currentUser.nom}</div>
+                <div style={{ fontSize: 10.5, color: theme.sub }}>{isRevendeurRole ? "Revendeur" : "Administrateur"}</div>
+              </div>
+              <button className="dz-btn" onClick={logout} title="Se déconnecter"
+                style={{ background: "transparent", color: theme.sub, width: 30, height: 30, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <X size={15} />
+              </button>
+            </div>
+          </div>
+        </header>
+
+        {/* CONTENT */}
+        <main style={{ flex: 1, overflowY: "auto", padding: 20 }} className="dz-fade-in dz-main" key={effectivePage}>
+          {effectivePage === "dashboard" && (
+            <Dashboard theme={theme} tickets={tickets} revendeurs={revendeurs} weeks={weeks} meta={meta} openWeekTickets={openWeekTickets} lastClosedTicket={lastClosedTicket} dark={dark} activities={activities} setPage={setPage} catLabels={catLabels} />
+          )}
+          {effectivePage === "import" && (
+            <ImportCSV theme={theme} dark={dark} tickets={tickets} setTickets={setTickets} revendeurFor={revendeurFor} meta={meta} setMeta={setMeta} showToast={showToast} addActivity={addActivity}
+              setWeeks={setWeeks} setActivities={setActivities} setRevendeurs={setRevendeurs} setTarifs={setTarifs} weeks={weeks} setCatLabels={setCatLabels} />
+          )}
+          {effectivePage === "revendeurs" && (
+            <Revendeurs theme={theme} dark={dark} revendeurs={revendeurs} setRevendeurs={setRevendeurs} tickets={tickets} showToast={showToast} addActivity={addActivity} />
+          )}
+          {effectivePage === "tarifs" && (
+            <Tarifs theme={theme} dark={dark} tarifs={tarifs} setTarifs={setTarifs} showToast={showToast} addActivity={addActivity} catLabels={catLabels} setCatLabels={setCatLabels} />
+          )}
+          {effectivePage === "hebdo" && (
+            <Hebdo theme={theme} dark={dark} tickets={tickets} revendeurs={revendeurs} revendeurFor={revendeurFor} weeks={weeks} setWeeks={setWeeks} lastClosedTicket={lastClosedTicket} openWeekTickets={openWeekTickets} maxTicketNum={maxTicketNum} showToast={showToast} addActivity={addActivity} setPage={setPage} catLabels={catLabels} />
+          )}
+          {effectivePage === "mensuel" && (
+            <RapportMensuel theme={theme} dark={dark} weeks={weeks} catLabels={catLabels} />
+          )}
+          {effectivePage === "annuel" && (
+            <RapportAnnuel theme={theme} dark={dark} weeks={weeks} catLabels={catLabels} />
+          )}
+          {effectivePage === "classements" && (
+            <Classements theme={theme} dark={dark} tickets={tickets} revendeurs={revendeurs} openWeekTickets={openWeekTickets} lastClosedTicket={lastClosedTicket} weeks={weeks} meta={meta} catLabels={catLabels} showToast={showToast} currentUser={currentUser} />
+          )}
+          {effectivePage === "mestickets" && (
+            <TicketsList theme={theme} dark={dark} tickets={tickets} revendeurs={revendeurs} catLabels={catLabels} showToast={showToast} currentUser={currentUser} />
+          )}
+          {effectivePage === "stats" && (
+            <Statistiques theme={theme} dark={dark} tickets={tickets} revendeurs={revendeurs} catLabels={catLabels} />
+          )}
+          {effectivePage === "sauvegarde" && (
+            <Sauvegarde theme={theme} dark={dark} showToast={showToast} addActivity={addActivity}
+              revendeurs={revendeurs} setRevendeurs={setRevendeurs}
+              tarifs={tarifs} setTarifs={setTarifs}
+              catLabels={catLabels} setCatLabels={setCatLabels}
+              tickets={tickets} setTickets={setTickets}
+              weeks={weeks} setWeeks={setWeeks}
+              meta={meta} setMeta={setMeta}
+              activities={activities} setActivities={setActivities} />
+          )}
+          {effectivePage === "journal" && (
+            <Journal theme={theme} dark={dark} activities={activities} />
+          )}
+          {effectivePage === "utilisateurs" && (
+            <Utilisateurs theme={theme} dark={dark} users={users} setUsers={setUsers} revendeurs={revendeurs} showToast={showToast} addActivity={addActivity} currentUser={currentUser} />
+          )}
+          {effectivePage === "parametres" && (
+            <Parametres theme={theme} dark={dark} setDark={setDark} settings={settings} setSettings={setSettings} showToast={showToast} addActivity={addActivity} catLabels={catLabels} tarifs={tarifs} />
+          )}
+          {effectivePage === "exports" && (
+            <Exports theme={theme} dark={dark} tickets={tickets} revendeurs={revendeurs} weeks={weeks} tarifs={tarifs} catLabels={catLabels} settings={settings} showToast={showToast} />
+          )}
+        </main>
+
+        <footer style={{
+          height: 34, minHeight: 34, display: "flex", alignItems: "center", justifyContent: "space-between",
+          padding: "0 14px", borderTop: `1px solid ${theme.border}`, background: theme.panel, fontSize: 11, color: theme.sub,
+        }}>
+          <span>DIAFA WIFIZONE PRO v1.0.0</span>
+          <span className="dz-fullscreen-btn">© 2026 DIAFA GROUP. Tous droits réservés.</span>
+          <span className="dz-fullscreen-btn" style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ width: 6, height: 6, borderRadius: 99, background: COLORS.secondary, display: "inline-block" }} />
+            Données locales (stockage sécurisé)
+          </span>
+        </footer>
+      </div>
+
+      {toast && (
+        <div style={{
+          position: "absolute", bottom: 20, right: 20, background: toast.kind === "error" ? COLORS.danger : COLORS.secondary,
+          color: "#fff", padding: "11px 16px", borderRadius: 10, fontSize: 13, fontWeight: 600,
+          display: "flex", alignItems: "center", gap: 8, boxShadow: "0 8px 24px rgba(0,0,0,.18)",
+        }}>
+          {toast.kind === "error" ? <AlertTriangle size={15} /> : <CheckCircle2 size={15} />}
+          {toast.text}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function seedRevendeurs() {
+  // Starter set inferred from the client's own prefix examples (Mh/Mj/Md -> Mamadi, Dh/Dj/Dd -> Doumbouya, etc.)
+  // Editable / deletable — just gives the app something to match against on first run.
+  const palette = ["#2563EB", "#10B981", "#F59E0B", "#8B5CF6", "#EF4444", "#0EA5E9", "#EC4899", "#14B8A6", "#F97316", "#6366F1"];
+  const base = [
+    { nom: "Mamadi", codes: ["Mh", "Mj", "Md"] },
+    { nom: "Doumbouya", codes: ["Dh", "Dj", "Dd"] },
+    { nom: "Jules", codes: ["Jh", "Js"] },
+    { nom: "Ibrahim", codes: ["Ih"] },
+    { nom: "Prestation", codes: ["Ph", "Pj", "Pd"] },
+    { nom: "Gouverneur", codes: ["Gh", "Gj", "Gd"] },
+    { nom: "Bintou", codes: ["Bh", "Bj", "Bd"] },
+    { nom: "Senegalais", codes: ["Sh", "Sj"] },
+    { nom: "Jannette", codes: ["Nh", "Nj"] },
+    { nom: "Mamie", codes: ["Mm"] },
+  ];
+  return base.map((r, i) => ({
+    id: uid(), nom: r.nom, telephone: "", adresse: "", codes: r.codes,
+    statut: "Actif", couleur: palette[i % palette.length], observations: "",
+  }));
+}
+
+/* ---- basic obfuscation only — this is a fully client-side app with no server,
+   so real password security isn't achievable here. Good enough to avoid storing
+   passwords in plain readable text; NOT a substitute for real auth in Phase 2. ---- */
+function obfuscate(str) {
+  try { return btoa(unescape(encodeURIComponent(str || ""))); } catch { return str || ""; }
+}
+function deobfuscate(str) {
+  try { return decodeURIComponent(escape(atob(str || ""))); } catch { return ""; }
+}
+
+function seedUsers() {
+  return [
+    { id: uid(), nom: "Administrateur", identifiant: "admin", motDePasse: obfuscate("admin123"), role: "admin", statut: "Actif" },
+  ];
+}
+
+/* ========================== DASHBOARD =================================== */
+function KpiCard({ theme, icon: Icon, color, label, value, sub, subGood }) {
+  return (
+    <div className="dz-card dz-kpi" style={{ padding: 16, flex: "1 1 150px", minWidth: 150 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 10 }}>
+        <div style={{ width: 30, height: 30, borderRadius: 9, background: color + "1a", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <Icon size={15} color={color} />
+        </div>
+        <div style={{ fontSize: 12, color: theme.sub, fontWeight: 600 }}>{label}</div>
+      </div>
+      <div style={{ fontSize: 19, fontWeight: 800 }}>{value}</div>
+      {sub && (
+        <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 5, fontSize: 11, fontWeight: 600, color: subGood ? COLORS.secondary : theme.sub }}>
+          {subGood ? <ArrowUpRight size={12} /> : null}{sub}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function timeAgo(ts) {
+  const diff = Math.max(0, Date.now() - ts);
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return "à l'instant";
+  if (min < 60) return `il y a ${min} min`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `il y a ${h} h`;
+  const d = Math.floor(h / 24);
+  return `il y a ${d} j`;
+}
+
+function Dashboard({ theme, tickets, revendeurs, weeks, meta, openWeekTickets, lastClosedTicket, dark, activities, setPage, catLabels }) {
+  const now = new Date();
+  const todayKey = dateKey(now);
+  const startOfWeek = new Date(now); startOfWeek.setDate(now.getDate() - now.getDay());
+  const withDate = tickets.map((t) => ({ ...t, _d: parseMikhmonDate(t.date, t.time) })).filter((t) => t._d);
+
+  const caToday = withDate.filter((t) => dateKey(t._d) === todayKey).reduce((s, t) => s + t.price, 0);
+  const caWeek = withDate.filter((t) => t._d >= startOfWeek).reduce((s, t) => s + t.price, 0);
+  const caMonth = withDate.filter((t) => t._d.getMonth() === now.getMonth() && t._d.getFullYear() === now.getFullYear()).reduce((s, t) => s + t.price, 0);
+  const caYear = withDate.filter((t) => t._d.getFullYear() === now.getFullYear()).reduce((s, t) => s + t.price, 0);
+
+  const [evoPeriod, setEvoPeriod] = useState("hebdo");
+
+  const last7 = useMemo(() => {
+    const days = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now); d.setDate(now.getDate() - i);
+      const key = dateKey(d);
+      const total = withDate.filter((t) => dateKey(t._d) === key).reduce((s, t) => s + t.price, 0);
+      days.push({ label: d.toLocaleDateString("fr-FR", { weekday: "short" }), ca: total });
+    }
+    return days;
+  }, [tickets]);
+
+  const last30 = useMemo(() => {
+    const days = [];
+    for (let i = 29; i >= 0; i--) {
+      const d = new Date(now); d.setDate(now.getDate() - i);
+      const key = dateKey(d);
+      const total = withDate.filter((t) => dateKey(t._d) === key).reduce((s, t) => s + t.price, 0);
+      days.push({ label: String(d.getDate()), ca: total });
+    }
+    return days;
+  }, [tickets]);
+
+  const last12Months = useMemo(() => {
+    const months = [];
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const total = withDate.filter((t) => t._d.getFullYear() === d.getFullYear() && t._d.getMonth() === d.getMonth()).reduce((s, t) => s + t.price, 0);
+      months.push({ label: d.toLocaleDateString("fr-FR", { month: "short" }), ca: total });
+    }
+    return months;
+  }, [tickets]);
+
+  const evoData = evoPeriod === "hebdo" ? last7 : evoPeriod === "mensuel" ? last30 : last12Months;
+
+  const byCat = useMemo(() => {
+    const acc = {};
+    tickets.forEach((t) => { const c = normalizeProfile(t.profile); acc[c] = (acc[c] || 0) + 1; });
+    return Object.entries(acc).map(([k, v]) => ({ name: catLabels[k] || CAT_LABEL[k] || k, value: v }));
+  }, [tickets]);
+  const PIE_COLORS = [COLORS.primary, COLORS.secondary, COLORS.accent, "#8B5CF6", COLORS.danger, "#64748B"];
+
+  const topRevendeurs = useMemo(() => {
+    const acc = {};
+    tickets.forEach((t) => {
+      const rid = t.revendeurId || "none";
+      acc[rid] = acc[rid] || { ca: 0, tickets: 0 };
+      acc[rid].ca += t.price; acc[rid].tickets += 1;
+    });
+    return Object.entries(acc)
+      .map(([rid, v]) => ({ nom: revendeurs.find((r) => r.id === rid)?.nom || "Non assigné", ...v }))
+      .sort((a, b) => b.ca - a.ca).slice(0, 5);
+  }, [tickets, revendeurs]);
+
+  const maxTop = Math.max(1, ...topRevendeurs.map((r) => r.ca));
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        <KpiCard theme={theme} icon={TrendingUp} color={COLORS.primary} label="CA Aujourd'hui" value={GNF(caToday)} />
+        <KpiCard theme={theme} icon={TrendingUp} color={COLORS.secondary} label="CA Semaine" value={GNF(caWeek)} />
+        <KpiCard theme={theme} icon={CalendarRange} color={COLORS.accent} label="CA Mois" value={GNF(caMonth)} />
+        <KpiCard theme={theme} icon={TrendingUp} color="#8B5CF6" label="CA Année" value={GNF(caYear)} />
+        <KpiCard theme={theme} icon={Ticket} color={COLORS.primary} label="Tickets importés" value={fmtInt(tickets.length)} />
+        <KpiCard theme={theme} icon={Users} color={COLORS.secondary} label="Revendeurs" value={fmtInt(revendeurs.length)} />
+      </div>
+
+      <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+        <div className="dz-card" style={{ flex: "2 1 380px", padding: 18 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
+            <div style={{ fontWeight: 700, fontSize: 13.5 }}>Évolution des ventes</div>
+            <div style={{ display: "flex", gap: 3, background: dark ? "#0F172A" : "#F1F5F9", padding: 3, borderRadius: 9 }}>
+              {[["hebdo", "Hebdomadaire"], ["mensuel", "Mensuel"], ["annuel", "Annuel"]].map(([id, label]) => (
+                <button key={id} className="dz-btn" onClick={() => setEvoPeriod(id)}
+                  style={{
+                    padding: "6px 11px", borderRadius: 7, fontSize: 11.5, fontWeight: 700,
+                    background: evoPeriod === id ? COLORS.primary : "transparent",
+                    color: evoPeriod === id ? "#fff" : theme.sub,
+                  }}>{label}</button>
+              ))}
+            </div>
+          </div>
+          <ResponsiveContainer width="100%" height={210}>
+            <AreaChart data={evoData}>
+              <defs>
+                <linearGradient id="dzGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={COLORS.primary} stopOpacity={0.35} />
+                  <stop offset="100%" stopColor={COLORS.primary} stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke={theme.border} vertical={false} />
+              <XAxis dataKey="label" tick={{ fontSize: 11, fill: theme.sub }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fontSize: 11, fill: theme.sub }} axisLine={false} tickLine={false} width={40} tickFormatter={(v) => (v >= 1000 ? v / 1000 + "k" : v)} />
+              <Tooltip formatter={(v) => GNF(v)} contentStyle={{ borderRadius: 10, border: `1px solid ${theme.border}`, fontSize: 12 }} />
+              <Area type="monotone" dataKey="ca" stroke={COLORS.primary} strokeWidth={2.5} fill="url(#dzGrad)" />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="dz-card" style={{ flex: "1 1 220px", padding: 18 }}>
+          <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 12 }}>Répartition par profil</div>
+          {byCat.length === 0 ? (
+            <div style={{ color: theme.sub, fontSize: 12.5, padding: "30px 0", textAlign: "center" }}>Aucune donnée importée</div>
+          ) : (
+            <ResponsiveContainer width="100%" height={190}>
+              <PieChart>
+                <Pie data={byCat} dataKey="value" nameKey="name" innerRadius={45} outerRadius={70} paddingAngle={2}>
+                  {byCat.map((_, i) => <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}
+                </Pie>
+                <Tooltip contentStyle={{ borderRadius: 10, fontSize: 12 }} />
+              </PieChart>
+            </ResponsiveContainer>
+          )}
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 6, justifyContent: "center" }}>
+            {byCat.map((c, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: theme.sub }}>
+                <span style={{ width: 8, height: 8, borderRadius: 99, background: PIE_COLORS[i % PIE_COLORS.length] }} />{c.name}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+        <div className="dz-card" style={{ flex: "1 1 300px", padding: 18 }}>
+          <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 14 }}>Top 5 revendeurs</div>
+          {topRevendeurs.length === 0 && <div style={{ color: theme.sub, fontSize: 12.5 }}>Importez des tickets pour voir le classement.</div>}
+          {topRevendeurs.map((r, i) => (
+            <div key={i} style={{ marginBottom: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 5 }}>
+                <span style={{ fontWeight: 600 }}>{i + 1}. {r.nom}</span>
+                <span style={{ fontWeight: 700 }}>{GNF(r.ca)}</span>
+              </div>
+              <div style={{ height: 6, borderRadius: 99, background: dark ? "#334155" : "#EEF2FF" }}>
+                <div style={{ height: 6, borderRadius: 99, width: `${(r.ca / maxTop) * 100}%`, background: COLORS.primary }} />
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="dz-card" style={{ flex: "1 1 220px", padding: 18 }}>
+          <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 12 }}>Dernier import</div>
+          {meta.lastImportFile ? (
+            <div style={{ fontSize: 12.5, color: theme.sub, display: "flex", flexDirection: "column", gap: 6 }}>
+              <Row label="Fichier" value={meta.lastImportFile} theme={theme} />
+              <Row label="Tickets ajoutés" value={fmtInt(meta.lastImportCount)} theme={theme} />
+              <Row label="Date" value={new Date(meta.lastImportDate).toLocaleString("fr-FR")} theme={theme} />
+            </div>
+          ) : <div style={{ color: theme.sub, fontSize: 12.5 }}>Aucun import pour le moment.</div>}
+        </div>
+
+        <div className="dz-card" style={{ flex: "1 1 220px", padding: 18 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <div style={{ fontWeight: 700, fontSize: 13.5 }}>Semaine en cours</div>
+          </div>
+          <div style={{ fontSize: 12.5, color: theme.sub, display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
+            <Row label="Tickets #" value={`${lastClosedTicket + 1} → ${openWeekTickets.length ? Math.max(...openWeekTickets.map(t=>t.globalId)) : "—"}`} theme={theme} />
+            <Row label="Tickets en attente" value={fmtInt(openWeekTickets.length)} theme={theme} />
+            <Row label="Semaines clôturées" value={fmtInt(weeks.length)} theme={theme} />
+          </div>
+          <button className="dz-btn" onClick={() => setPage("hebdo")}
+            style={{ width: "100%", background: "transparent", border: `1px solid ${theme.border}`, color: COLORS.primary, padding: "8px 0", borderRadius: 8, fontSize: 12, fontWeight: 700 }}>
+            Voir le rapport
+          </button>
+        </div>
+
+        <div className="dz-card" style={{ flex: "1 1 260px", padding: 18 }}>
+          <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 12, display: "flex", alignItems: "center", gap: 7 }}>
+            <ActivityIcon size={14} color={theme.sub} /> Activités récentes
+          </div>
+          {activities.length === 0 ? (
+            <div style={{ color: theme.sub, fontSize: 12.5 }}>Aucune activité pour le moment.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, maxHeight: 190, overflowY: "auto" }}>
+              {activities.slice(0, 6).map((a) => (
+                <div key={a.id} style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                  <div>
+                    <div style={{ fontSize: 12.5, fontWeight: 600 }}>{a.text}</div>
+                    {a.sub && <div style={{ fontSize: 11, color: theme.sub }}>{a.sub}</div>}
+                  </div>
+                  <div style={{ fontSize: 10.5, color: theme.sub, whiteSpace: "nowrap" }}>{timeAgo(a.time)}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+function Row({ label, value, theme }) {
+  return <div style={{ display: "flex", justifyContent: "space-between" }}><span>{label}</span><span style={{ color: theme.text, fontWeight: 600 }}>{value}</span></div>;
+}
+
+/* ========================== IMPORT CSV ==================================== */
+function ImportCSV({ theme, dark, tickets, setTickets, revendeurFor, meta, setMeta, showToast, addActivity, setWeeks, setActivities, setRevendeurs, setTarifs, weeks, setCatLabels }) {
+  const [preview, setPreview] = useState(null); // { rows, newCount, dupCount, fileName }
+  const [busy, setBusy] = useState(false);
+  const [confirmAction, setConfirmAction] = useState(null); // "tickets" | "all" | null
+  const fileRef = useRef(null);
+
+  function parseMikhmonCSV(text) {
+    const parsed = Papa.parse(text, { skipEmptyLines: true });
+    const rows = parsed.data;
+    const clean = (c) => (c || "").toString().trim().toLowerCase().replace(/[;,]+$/g, ""); // strip stray trailing ; or , (Excel re-export artifacts)
+    let headerIdx = rows.findIndex((r) => r.some((c) => clean(c) === "username"));
+    if (headerIdx === -1) throw new Error("Colonne 'Username' introuvable — ce fichier ne ressemble pas à un export Mikhmon.");
+    const header = rows[headerIdx].map(clean);
+    const idx = (name) => {
+      const exact = header.indexOf(name);
+      if (exact !== -1) return exact;
+      return header.findIndex((h) => h.startsWith(name)); // tolerate "price;;;;" etc.
+    };
+    const iNum = idx("№") !== -1 ? idx("№") : idx("n°");
+    const iDate = idx("date"), iTime = idx("time"), iUser = idx("username"), iProfile = idx("profile"), iComment = idx("comment"), iPrice = idx("price");
+
+    const out = [];
+    for (let i = headerIdx + 1; i < rows.length; i++) {
+      const r = rows[i];
+      const num = parseInt(r[iNum], 10);
+      if (!num || !r[iUser]) continue; // skip totals/footer rows
+      const price = parseInt((r[iPrice] || "0").toString().replace(/[^\d-]/g, ""), 10) || 0;
+      out.push({
+        num, date: r[iDate] || "", time: r[iTime] || "", username: (r[iUser] || "").trim(),
+        profile: r[iProfile] || "", comment: r[iComment] || "", price,
+      });
+    }
+    return out;
+  }
+
+  function ticketKey(r) { return `${r.date}|${r.time}|${r.username}`.toLowerCase(); }
+
+  function handleFile(file) {
+    setBusy(true);
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const rows = parseMikhmonCSV(reader.result);
+        const existingKeys = new Set(tickets.map(ticketKey));
+        const seenInFile = new Set();
+        const fresh = rows.filter((r) => {
+          const k = ticketKey(r);
+          if (existingKeys.has(k) || seenInFile.has(k)) return false; // already in DB, or duplicated within this same file
+          seenInFile.add(k);
+          return true;
+        });
+        const zeroPriceCount = fresh.filter((r) => r.price === 0).length;
+
+        // Guard against "late" tickets whose date predates the last closed week — if Mikhmon's
+        // export ever includes a ticket that was missed earlier, we don't want it silently
+        // inflating the *current* week's report just because it's new to our database.
+        const lastClosedWeek = weeks.length ? weeks[weeks.length - 1] : null;
+        const lastClosedDate = lastClosedWeek ? parseMikhmonDate(lastClosedWeek.endDate, "23:59:59") : null;
+        const lateCount = lastClosedDate
+          ? fresh.filter((r) => { const d = parseMikhmonDate(r.date, r.time); return d && d <= lastClosedDate; }).length
+          : 0;
+
+        setPreview({ fileName: file.name, rows: fresh, dupCount: rows.length - fresh.length, totalInFile: rows.length, zeroPriceCount, lateCount });
+      } catch (e) {
+        showToast(e.message || "Erreur de lecture du fichier", "error");
+      } finally { setBusy(false); }
+    };
+    reader.onerror = () => { setBusy(false); showToast("Impossible de lire le fichier", "error"); };
+    reader.readAsText(file);
+  }
+
+  function confirmImport() {
+    if (!preview || preview.rows.length === 0) return;
+    // Mikhmon's № resets with every export, so it can't be trusted as a stable, ever-growing
+    // ticket ID across multiple files. We assign our own internal, always-incrementing globalId
+    // — sorted chronologically — which is what "Rapport Hebdomadaire" actually tracks against.
+    let nextId = tickets.length ? Math.max(...tickets.map((t) => t.globalId || 0)) : 0;
+    const withRevendeur = preview.rows
+      .slice()
+      .sort((a, b) => {
+        const da = parseMikhmonDate(a.date, a.time), db = parseMikhmonDate(b.date, b.time);
+        if (da && db) return da - db;
+        return a.num - b.num;
+      })
+      .map((r) => {
+        const rev = revendeurFor(r.username);
+        nextId += 1;
+        return { ...r, prefix: r.username.slice(0, 2), revendeurId: rev ? rev.id : null, globalId: nextId };
+      });
+    setTickets((prev) => [...prev, ...withRevendeur]);
+    setMeta({ lastImportFile: preview.fileName, lastImportDate: Date.now(), lastImportCount: withRevendeur.length });
+    addActivity("Import CSV réussi", `${preview.fileName} · ${withRevendeur.length} tickets`);
+    showToast(`${withRevendeur.length} nouveaux tickets importés`);
+    setPreview(null);
+    if (fileRef.current) fileRef.current.value = "";
+  }
+
+  function deleteTicketsOnly() {
+    setTickets([]);
+    setWeeks([]);
+    setMeta({ lastImportFile: null, lastImportDate: null, lastImportCount: 0 });
+    addActivity("Tickets réinitialisés", "Tous les tickets et rapports hebdomadaires supprimés");
+    showToast("Tickets et rapports supprimés");
+    setConfirmAction(null);
+  }
+
+  function resetEverything() {
+    setTickets([]);
+    setWeeks([]);
+    setMeta({ lastImportFile: null, lastImportDate: null, lastImportCount: 0 });
+    setActivities([]);
+    setRevendeurs(seedRevendeurs());
+    setTarifs(DEFAULT_TARIFS);
+    setCatLabels(DEFAULT_CAT_LABELS);
+    showToast("Application réinitialisée");
+    setConfirmAction(null);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 820 }}>
+      <div className="dz-card" style={{ padding: 26, textAlign: "center", border: `2px dashed ${theme.border}` }}
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => { e.preventDefault(); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); }}>
+        <div style={{ width: 46, height: 46, borderRadius: 12, background: COLORS.primary + "1a", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}>
+          <UploadCloud size={22} color={COLORS.primary} />
+        </div>
+        <div style={{ fontWeight: 700, fontSize: 14.5 }}>Glissez votre export Mikhmon ici</div>
+        <div style={{ color: theme.sub, fontSize: 12.5, margin: "6px 0 14px" }}>Fichier .csv — les tickets déjà importés sont ignorés automatiquement.</div>
+        <input ref={fileRef} type="file" accept=".csv,text/csv" style={{ display: "none" }} onChange={(e) => e.target.files[0] && handleFile(e.target.files[0])} />
+        <button className="dz-btn" disabled={busy} onClick={() => fileRef.current.click()}
+          style={{ background: COLORS.primary, color: "#fff", padding: "9px 18px", borderRadius: 9, fontSize: 13, fontWeight: 600 }}>
+          {busy ? "Lecture…" : "Choisir un fichier CSV"}
+        </button>
+      </div>
+
+      {preview && (
+        <div className="dz-card" style={{ padding: 18 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700, fontSize: 13.5 }}>
+              <FileSpreadsheet size={16} color={COLORS.primary} /> {preview.fileName}
+            </div>
+            <button className="dz-btn" onClick={() => setPreview(null)} style={{ background: "transparent", color: theme.sub }}><X size={16} /></button>
+          </div>
+          <div style={{ display: "flex", gap: 12, marginBottom: 14, flexWrap: "wrap" }}>
+            <MiniStat label="Lignes dans le fichier" value={preview.totalInFile} theme={theme} />
+            <MiniStat label="Déjà importés (ignorés)" value={preview.dupCount} theme={theme} color={COLORS.accent} />
+            <MiniStat label="Nouveaux tickets" value={preview.rows.length} theme={theme} color={COLORS.secondary} />
+          </div>
+          {preview.zeroPriceCount > 0 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", borderRadius: 10, background: COLORS.danger + "12", border: `1px solid ${COLORS.danger}44`, marginBottom: 14, fontSize: 12.5, color: theme.text }}>
+              <AlertTriangle size={15} color={COLORS.danger} style={{ flexShrink: 0 }} />
+              <span><b>{fmtInt(preview.zeroPriceCount)} ticket(s) à 0 GNF</b> détecté(s) dans ce fichier — vérifiez que la colonne "Price" n'a pas été altérée (ex. export réenregistré depuis Excel) avant de confirmer.</span>
+            </div>
+          )}
+          {preview.lateCount > 0 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", borderRadius: 10, background: COLORS.accent + "12", border: `1px solid ${COLORS.accent}44`, marginBottom: 14, fontSize: 12.5, color: theme.text }}>
+              <AlertTriangle size={15} color={COLORS.accent} style={{ flexShrink: 0 }} />
+              <span><b>{fmtInt(preview.lateCount)} ticket(s) antérieur(s)</b> à la dernière semaine clôturée — ils seront comptés dans les totaux mensuels/annuels, mais <b>pas</b> dans la semaine en cours, pour ne pas gonfler le rapport actuel des revendeurs.</span>
+            </div>
+          )}
+          {preview.rows.length === 0 ? (
+            <div style={{ fontSize: 12.5, color: theme.sub }}>Tous les tickets de ce fichier sont déjà dans la base — rien à importer.</div>
+          ) : (
+            <>
+              <div style={{ maxHeight: 220, overflowY: "auto", border: `1px solid ${theme.border}`, borderRadius: 10, marginBottom: 14 }}>
+                <table className="dz-table" style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead><tr><th>#</th><th>Date</th><th>Username</th><th>Profil</th><th>Revendeur</th><th style={{ textAlign: "right" }}>Prix</th></tr></thead>
+                  <tbody>
+                    {preview.rows.slice(0, 60).map((r) => {
+                      const rev = revendeurFor(r.username);
+                      return (
+                        <tr key={`${r.num}-${r.date}-${r.time}-${r.username}`}>
+                          <td>{r.num}</td><td>{r.date}</td><td>{r.username}</td><td>{r.profile}</td>
+                          <td>{rev ? rev.nom : <span style={{ color: COLORS.accent }}>Non assigné</span>}</td>
+                          <td style={{ textAlign: "right" }}>{GNF(r.price)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                {preview.rows.length > 60 && <div style={{ padding: 10, fontSize: 11.5, color: theme.sub, textAlign: "center" }}>+ {preview.rows.length - 60} autres lignes…</div>}
+              </div>
+              <button className="dz-btn" onClick={confirmImport}
+                style={{ background: COLORS.secondary, color: "#fff", padding: "10px 20px", borderRadius: 9, fontWeight: 700, fontSize: 13.5, display: "flex", alignItems: "center", gap: 7 }}>
+                <CheckCircle2 size={15} /> Confirmer l'import de {preview.rows.length} tickets
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
+      <div className="dz-card" style={{ padding: 18, border: `1px solid ${COLORS.danger}33` }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700, fontSize: 13.5, color: COLORS.danger, marginBottom: 4 }}>
+          <AlertTriangle size={15} /> Zone de danger
+        </div>
+        <div style={{ fontSize: 12, color: theme.sub, marginBottom: 14 }}>
+          Ces actions sont irréversibles. Utilisez-les pour repartir sur une base propre (ex. après un test).
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 260px", padding: 14, borderRadius: 10, background: dark ? "#0F172A" : "#F8FAFC", border: `1px solid ${theme.border}` }}>
+            <div style={{ fontWeight: 600, fontSize: 12.5, marginBottom: 3 }}>Supprimer les tickets importés</div>
+            <div style={{ fontSize: 11.5, color: theme.sub, marginBottom: 10 }}>
+              Efface les {fmtInt(tickets.length)} tickets et les {fmtInt(weeks.length)} semaine(s) clôturée(s). Les revendeurs et tarifs sont conservés.
+            </div>
+            <button className="dz-btn" disabled={tickets.length === 0} onClick={() => setConfirmAction("tickets")}
+              style={{ background: "transparent", border: `1px solid ${COLORS.danger}`, color: COLORS.danger, padding: "7px 14px", borderRadius: 8, fontSize: 12, fontWeight: 700, opacity: tickets.length ? 1 : .5 }}>
+              Supprimer les tickets
+            </button>
+          </div>
+          <div style={{ flex: "1 1 260px", padding: 14, borderRadius: 10, background: dark ? "#0F172A" : "#F8FAFC", border: `1px solid ${theme.border}` }}>
+            <div style={{ fontWeight: 600, fontSize: 12.5, marginBottom: 3 }}>Réinitialiser toute l'application</div>
+            <div style={{ fontSize: 11.5, color: theme.sub, marginBottom: 10 }}>
+              Efface tickets, rapports, activités, et remet revendeurs/tarifs à leurs valeurs de départ.
+            </div>
+            <button className="dz-btn" onClick={() => setConfirmAction("all")}
+              style={{ background: COLORS.danger, color: "#fff", padding: "7px 14px", borderRadius: 8, fontSize: 12, fontWeight: 700 }}>
+              Tout réinitialiser
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {confirmAction && (
+        <Modal theme={theme} onClose={() => setConfirmAction(null)} title={confirmAction === "all" ? "Réinitialiser toute l'application ?" : "Supprimer tous les tickets ?"}>
+          <div style={{ fontSize: 13, color: theme.sub, marginBottom: 16, lineHeight: 1.5 }}>
+            {confirmAction === "all"
+              ? "Cette action supprime définitivement tous les tickets, rapports hebdomadaires, activités, et réinitialise les revendeurs et tarifs à leurs valeurs de départ. Cette action est irréversible."
+              : `Cette action supprime définitivement les ${fmtInt(tickets.length)} tickets importés et les ${fmtInt(weeks.length)} semaine(s) clôturée(s). Les revendeurs et tarifs restent inchangés. Cette action est irréversible.`}
+          </div>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <button className="dz-btn" onClick={() => setConfirmAction(null)} style={{ background: dark ? "#334155" : "#F1F5F9", color: theme.text, padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600 }}>Annuler</button>
+            <button className="dz-btn" onClick={confirmAction === "all" ? resetEverything : deleteTicketsOnly}
+              style={{ background: COLORS.danger, color: "#fff", padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 700 }}>
+              {confirmAction === "all" ? "Oui, tout réinitialiser" : "Oui, supprimer"}
+            </button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+function MiniStat({ label, value, theme, color }) {
+  return (
+    <div style={{ flex: "1 1 140px", padding: "10px 14px", borderRadius: 10, background: theme.bg === COLORS.bgDark ? "#0F172A" : "#F8FAFC", border: `1px solid ${theme.border}` }}>
+      <div style={{ fontSize: 11, color: theme.sub, fontWeight: 600 }}>{label}</div>
+      <div style={{ fontSize: 17, fontWeight: 800, color: color || theme.text }}>{fmtInt(value)}</div>
+    </div>
+  );
+}
+
+/* ========================== REVENDEURS ==================================== */
+function Revendeurs({ theme, dark, revendeurs, setRevendeurs, tickets, showToast, addActivity }) {
+  const [editing, setEditing] = useState(null); // revendeur object or 'new'
+  const [search, setSearch] = useState("");
+  const [statutFilter, setStatutFilter] = useState("Tous");
+
+  const caFor = (id) => tickets.filter((t) => t.revendeurId === id).reduce((s, t) => s + t.price, 0);
+  const ticketsFor = (id) => tickets.filter((t) => t.revendeurId === id).length;
+
+  const filtered = revendeurs
+    .filter((r) => r.nom.toLowerCase().includes(search.toLowerCase()) || r.codes.join(",").toLowerCase().includes(search.toLowerCase()))
+    .filter((r) => statutFilter === "Tous" || (r.statut || "Actif") === statutFilter);
+
+  function save(rev) {
+    const codes = rev.codesInput.split(",").map((c) => c.trim()).filter(Boolean);
+    const dup = revendeurs.find((r) => r.id !== rev.id && r.codes.some((c) => codes.map(x=>x.toLowerCase()).includes(c.toLowerCase())));
+    if (dup) { showToast(`Code déjà utilisé par ${dup.nom}`, "error"); return; }
+    if (rev.id) {
+      setRevendeurs((prev) => prev.map((r) => r.id === rev.id ? { ...r, nom: rev.nom, telephone: rev.telephone, adresse: rev.adresse, codes, statut: rev.statut, couleur: rev.couleur, observations: rev.observations } : r));
+      addActivity("Revendeur modifié", rev.nom);
+      showToast("Revendeur mis à jour");
+    } else {
+      setRevendeurs((prev) => [...prev, { id: uid(), nom: rev.nom, telephone: rev.telephone, adresse: rev.adresse, codes, statut: rev.statut || "Actif", couleur: rev.couleur || COLORS.primary, observations: rev.observations || "" }]);
+      addActivity("Revendeur ajouté", rev.nom);
+      showToast("Revendeur ajouté");
+    }
+    setEditing(null);
+  }
+  function remove(id) {
+    const rev = revendeurs.find((r) => r.id === id);
+    setRevendeurs((prev) => prev.filter((r) => r.id !== id));
+    addActivity("Revendeur supprimé", rev?.nom);
+    showToast("Revendeur supprimé");
+  }
+  function toggleStatut(id) {
+    const rev = revendeurs.find((r) => r.id === id);
+    const next = (rev.statut || "Actif") === "Actif" ? "Inactif" : "Actif";
+    setRevendeurs((prev) => prev.map((r) => r.id === id ? { ...r, statut: next } : r));
+    addActivity(`Revendeur ${next === "Actif" ? "réactivé" : "désactivé"}`, rev.nom);
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14, gap: 10, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 8, flex: "1 1 320px" }}>
+          <div style={{ position: "relative", flex: "1 1 220px", maxWidth: 300 }}>
+            <Search size={14} style={{ position: "absolute", left: 11, top: 10.5 }} color={theme.sub} />
+            <input className="dz-input" style={{ paddingLeft: 32 }} placeholder="Rechercher un revendeur ou un code…" value={search} onChange={(e) => setSearch(e.target.value)} />
+          </div>
+          <select className="dz-input" style={{ width: 140 }} value={statutFilter} onChange={(e) => setStatutFilter(e.target.value)}>
+            <option>Tous</option><option>Actif</option><option>Inactif</option>
+          </select>
+        </div>
+        <button className="dz-btn" onClick={() => setEditing({ id: null, nom: "", telephone: "", adresse: "", codesInput: "", statut: "Actif", couleur: COLORS.primary, observations: "" })}
+          style={{ background: COLORS.primary, color: "#fff", padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+          <Plus size={15} /> Nouveau revendeur
+        </button>
+      </div>
+
+      <div className="dz-card" style={{ overflowX: "auto", overflowY: "hidden" }}>
+        <table className="dz-table" style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead><tr><th>Nom</th><th>Codes</th><th>Statut</th><th>Téléphone</th><th style={{ textAlign: "right" }}>Tickets</th><th style={{ textAlign: "right" }}>CA total</th><th></th></tr></thead>
+          <tbody>
+            {filtered.map((r) => (
+              <tr key={r.id} style={{ opacity: (r.statut || "Actif") === "Inactif" ? .55 : 1 }}>
+                <td style={{ fontWeight: 600 }}>
+                  <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 99, background: r.couleur || COLORS.primary, marginRight: 8 }} />
+                  {r.nom}
+                </td>
+                <td>{r.codes.map((c) => <span key={c} style={{ background: COLORS.primary + "15", color: COLORS.primary, padding: "2px 8px", borderRadius: 6, fontSize: 11, fontWeight: 700, marginRight: 4 }}>{c}</span>)}</td>
+                <td>
+                  <span className="dz-btn" onClick={() => toggleStatut(r.id)}
+                    style={{ fontSize: 11, fontWeight: 700, padding: "3px 9px", borderRadius: 99, background: (r.statut || "Actif") === "Actif" ? COLORS.secondary + "1a" : theme.sub + "22", color: (r.statut || "Actif") === "Actif" ? COLORS.secondary : theme.sub }}>
+                    {r.statut || "Actif"}
+                  </span>
+                </td>
+                <td style={{ color: theme.sub }}>{r.telephone || "—"}</td>
+                <td style={{ textAlign: "right" }}>{fmtInt(ticketsFor(r.id))}</td>
+                <td style={{ textAlign: "right", fontWeight: 700 }}>{GNF(caFor(r.id))}</td>
+                <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                  <button className="dz-btn" onClick={() => setEditing({ ...r, codesInput: r.codes.join(", "), statut: r.statut || "Actif", couleur: r.couleur || COLORS.primary, observations: r.observations || "" })} style={{ background: "transparent", color: theme.sub, padding: 5 }}><Pencil size={14} /></button>
+                  <button className="dz-btn" onClick={() => remove(r.id)} style={{ background: "transparent", color: COLORS.danger, padding: 5 }}><Trash2 size={14} /></button>
+                </td>
+              </tr>
+            ))}
+            {filtered.length === 0 && <tr><td colSpan={7} style={{ textAlign: "center", color: theme.sub, padding: 24 }}>Aucun revendeur trouvé.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+
+      {editing && (
+        <Modal theme={theme} onClose={() => setEditing(null)} title={editing.id ? "Modifier le revendeur" : "Nouveau revendeur"}>
+          <Field label="Nom" theme={theme}><input className="dz-input" value={editing.nom} onChange={(e) => setEditing({ ...editing, nom: e.target.value })} /></Field>
+          <Field label="Codes (préfixes username, séparés par des virgules)" theme={theme}>
+            <input className="dz-input" placeholder="Mh, Mj, Md" value={editing.codesInput} onChange={(e) => setEditing({ ...editing, codesInput: e.target.value })} />
+          </Field>
+          <Field label="Téléphone" theme={theme}><input className="dz-input" value={editing.telephone} onChange={(e) => setEditing({ ...editing, telephone: e.target.value })} /></Field>
+          <Field label="Adresse" theme={theme}><input className="dz-input" value={editing.adresse} onChange={(e) => setEditing({ ...editing, adresse: e.target.value })} /></Field>
+          <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ flex: 1 }}>
+              <Field label="Statut" theme={theme}>
+                <select className="dz-input" value={editing.statut} onChange={(e) => setEditing({ ...editing, statut: e.target.value })}>
+                  <option>Actif</option><option>Inactif</option>
+                </select>
+              </Field>
+            </div>
+            <div>
+              <Field label="Couleur" theme={theme}>
+                <input type="color" value={editing.couleur} onChange={(e) => setEditing({ ...editing, couleur: e.target.value })}
+                  style={{ width: 44, height: 36, padding: 2, border: `1px solid ${theme.border}`, borderRadius: 9, background: "transparent", cursor: "pointer" }} />
+              </Field>
+            </div>
+          </div>
+          <Field label="Observations" theme={theme}>
+            <textarea className="dz-input" rows={2} style={{ resize: "vertical" }} value={editing.observations} onChange={(e) => setEditing({ ...editing, observations: e.target.value })} />
+          </Field>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 6 }}>
+            <button className="dz-btn" onClick={() => setEditing(null)} style={{ background: dark ? "#334155" : "#F1F5F9", color: theme.text, padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600 }}>Annuler</button>
+            <button className="dz-btn" disabled={!editing.nom.trim()} onClick={() => save(editing)} style={{ background: COLORS.primary, color: "#fff", padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600, opacity: editing.nom.trim() ? 1 : .5 }}>Enregistrer</button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+function Field({ label, theme, children }) {
+  return <div style={{ marginBottom: 12 }}><div style={{ fontSize: 12, fontWeight: 600, color: theme.sub, marginBottom: 5 }}>{label}</div>{children}</div>;
+}
+function Modal({ theme, onClose, title, children }) {
+  return (
+    <div style={{ position: "absolute", inset: 0, background: "rgba(15,23,42,.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 20 }} onClick={onClose}>
+      <div className="dz-card dz-fade-in" style={{ width: 380, maxWidth: "90%", padding: 20, background: theme.panel }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div style={{ fontWeight: 700, fontSize: 15 }}>{title}</div>
+          <button className="dz-btn" onClick={onClose} style={{ background: "transparent", color: theme.sub }}><X size={17} /></button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/* ========================== TARIFS ==================================== */
+function Tarifs({ theme, dark, tarifs, setTarifs, showToast, addActivity, catLabels, setCatLabels }) {
+  const [form, setForm] = useState(tarifs);
+  const [labelForm, setLabelForm] = useState(catLabels);
+  useEffect(() => setForm(tarifs), [tarifs]);
+  useEffect(() => setLabelForm(catLabels), [catLabels]);
+  const dirty = JSON.stringify(form) !== JSON.stringify(tarifs) || JSON.stringify(labelForm) !== JSON.stringify(catLabels);
+
+  const rows = [
+    { key: "heure", desc: "Validité 24h" },
+    { key: "jour", desc: "Validité 50h" },
+    { key: "deuxJours", desc: "Forfait 2 jours" },
+    { key: "semaine", desc: "Validité 7 jours" },
+    { key: "mois", desc: "Validité 30 jours" },
+  ];
+
+  function save() {
+    setTarifs(form);
+    setCatLabels(labelForm);
+    addActivity("Tarifs modifiés");
+    showToast("Grille tarifaire enregistrée");
+  }
+
+  return (
+    <div style={{ maxWidth: 640 }}>
+      <div className="dz-card" style={{ padding: 20 }}>
+        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 4 }}>Grille tarifaire</div>
+        <div style={{ fontSize: 12, color: theme.sub, marginBottom: 18 }}>
+          Le nom de chaque forfait est libre (ex. "Forfait Choco" au lieu de "Heure") — le prix effectif de chaque vente reste celui importé depuis Mikhmon.
+        </div>
+        {rows.map((r) => (
+          <div key={r.key} style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 0", borderBottom: `1px solid ${theme.border}`, flexWrap: "wrap" }}>
+            <div style={{ flex: "1 1 200px" }}>
+              <input className="dz-input" value={labelForm[r.key]} onChange={(e) => setLabelForm({ ...labelForm, [r.key]: e.target.value })}
+                style={{ fontWeight: 700, fontSize: 13.5, padding: "7px 10px", marginBottom: 3 }} placeholder={CAT_LABEL[r.key]} />
+              <div style={{ fontSize: 11.5, color: theme.sub, marginLeft: 2 }}>{r.desc}</div>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input className="dz-input" type="number" style={{ width: 130, textAlign: "right" }} value={form[r.key]} onChange={(e) => setForm({ ...form, [r.key]: parseInt(e.target.value, 10) || 0 })} />
+              <span style={{ fontSize: 12, color: theme.sub }}>GNF</span>
+            </div>
+          </div>
+        ))}
+        <button className="dz-btn" disabled={!dirty} onClick={save}
+          style={{ marginTop: 18, background: COLORS.primary, color: "#fff", padding: "10px 18px", borderRadius: 9, fontSize: 13.5, fontWeight: 700, display: "flex", alignItems: "center", gap: 7, opacity: dirty ? 1 : .5 }}>
+          <Save size={15} /> Enregistrer les tarifs
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ========================== RAPPORT HEBDOMADAIRE ========================= */
+/* ---- Rapport hebdomadaire -> image PNG (partage WhatsApp) ---------------- */
+function wrapCanvasText(ctx, text, x, y, maxWidth, lineHeight) {
+  const words = text.split(" ");
+  let line = "", cy = y;
+  words.forEach((w) => {
+    const test = line + w + " ";
+    if (ctx.measureText(test).width > maxWidth && line) {
+      ctx.fillText(line.trim(), x, cy);
+      line = w + " ";
+      cy += lineHeight;
+    } else line = test;
+  });
+  ctx.fillText(line.trim(), x, cy);
+  return cy;
+}
+
+function drawReportImage({ rows, totalCA, totalTickets, title, subtitle, ticketRange, catLabels, hideTotal }) {
+  const L = { ...CAT_LABEL, ...(catLabels || {}) };
+  const short = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + "…" : s);
+  const W = 880, padX = 28, headerH = 132, colHeaderH = 34, rowH = 32, footerH = 78;
+  const H = headerH + colHeaderH + Math.max(rows.length, 1) * rowH + (hideTotal ? 0 : 34) /* total row */ + footerH;
+  const scale = 2;
+  const canvas = document.createElement("canvas");
+  canvas.width = W * scale; canvas.height = H * scale;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(scale, scale);
+
+  ctx.fillStyle = "#FFFFFF"; ctx.fillRect(0, 0, W, H);
+
+  const grad = ctx.createLinearGradient(0, 0, W, 0);
+  grad.addColorStop(0, "#2563EB"); grad.addColorStop(1, "#1D4ED8");
+  ctx.fillStyle = grad; ctx.fillRect(0, 0, W, headerH);
+
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#FFFFFF";
+  ctx.font = "800 24px Arial, sans-serif";
+  ctx.fillText("DIAFA WIFIZONE PRO", padX, 42);
+  ctx.font = "700 16px Arial, sans-serif";
+  ctx.fillText(title, padX, 70);
+  ctx.font = "13px Arial, sans-serif";
+  ctx.globalAlpha = 0.9;
+  ctx.fillText(subtitle, padX, 92);
+  ctx.fillText(ticketRange, padX, 112);
+  ctx.globalAlpha = 1;
+
+  const cols = [
+    { key: "nom", label: "Revendeur", w: 200, align: "left" },
+    { key: "heure", label: short(L.heure, 8), w: 64, align: "right" },
+    { key: "jour", label: short(L.jour, 8), w: 64, align: "right" },
+    { key: "deuxJours", label: short(L.deuxJours, 6), w: 56, align: "right" },
+    { key: "semaine", label: short(L.semaine, 7), w: 64, align: "right" },
+    { key: "mois", label: short(L.mois, 6), w: 56, align: "right" },
+    { key: "tickets", label: "Tickets", w: 76, align: "right" },
+    { key: "ca", label: "CA (GNF)", w: 0, align: "right" },
+  ];
+  const fixedW = cols.slice(0, -1).reduce((s, c) => s + c.w, 0);
+  cols[cols.length - 1].w = W - padX * 2 - fixedW;
+
+  let y = headerH;
+  ctx.fillStyle = "#F1F5F9"; ctx.fillRect(0, y, W, colHeaderH);
+  ctx.fillStyle = "#475569";
+  ctx.font = "700 10.5px Arial, sans-serif";
+  let x = padX;
+  cols.forEach((c) => {
+    ctx.textAlign = c.align;
+    ctx.fillText(c.label.toUpperCase(), c.align === "left" ? x : x + c.w, y + 22);
+    x += c.w;
+  });
+  y += colHeaderH;
+
+  rows.forEach((r, i) => {
+    ctx.fillStyle = i % 2 === 0 ? "#FFFFFF" : "#F8FAFC";
+    ctx.fillRect(0, y, W, rowH);
+    let x = padX;
+    cols.forEach((c) => {
+      ctx.textAlign = c.align;
+      let val;
+      if (c.key === "nom") val = r.nom;
+      else if (c.key === "ca") val = GNF(r.ca);
+      else if (c.key === "tickets") val = fmtInt(r.tickets);
+      else val = fmtInt(r[c.key] || 0);
+      ctx.fillStyle = "#1E293B";
+      ctx.font = (c.key === "nom" || c.key === "ca") ? "700 12.5px Arial, sans-serif" : "500 12.5px Arial, sans-serif";
+      ctx.fillText(String(val), c.align === "left" ? x : x + c.w, y + 21);
+      x += c.w;
+    });
+    y += rowH;
+    ctx.strokeStyle = "#E2E8F0"; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  });
+
+  if (!hideTotal) {
+    ctx.fillStyle = "#EFF6FF"; ctx.fillRect(0, y, W, 34);
+    ctx.fillStyle = "#2563EB"; ctx.font = "800 13px Arial, sans-serif";
+    ctx.textAlign = "left"; ctx.fillText("TOTAL", padX, y + 22);
+    ctx.textAlign = "right"; ctx.fillText(GNF(totalCA), W - padX, y + 22);
+    ctx.font = "700 11px Arial, sans-serif";
+    ctx.fillText(fmtInt(totalTickets) + " tickets", W - padX - 150, y + 22);
+    y += 34 + 14;
+  } else {
+    y += 14;
+  }
+
+  ctx.fillStyle = "#475569";
+  ctx.font = "italic 12px Arial, sans-serif";
+  ctx.textAlign = "left";
+  wrapCanvasText(ctx, "Merci de vérifier votre position et de déposer votre versement auprès de l'agent de recouvrement.", padX, y, W - padX * 2, 16);
+
+  ctx.fillStyle = "#94A3B8"; ctx.font = "10px Arial, sans-serif";
+  ctx.fillText("Généré le " + new Date().toLocaleString("fr-FR") + " — DIAFA WIFIZONE PRO", padX, H - 14);
+
+  return canvas;
+}
+
+async function exportReportImage(canvas, filename, shareTitle, shareText, showToast) {
+  try {
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    if (!blob) throw new Error("blob failed");
+    const file = new File([blob], filename, { type: "image/png" });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: shareTitle, text: shareText });
+      showToast && showToast("Rapport partagé");
+      return;
+    }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    showToast && showToast("Image téléchargée — envoyez-la depuis WhatsApp");
+  } catch (e) {
+    if (e && e.name === "AbortError") return;
+    showToast && showToast("Échec de l'export de l'image", "error");
+  }
+}
+
+function Hebdo({ theme, dark, tickets, revendeurs, revendeurFor, weeks, setWeeks, lastClosedTicket, openWeekTickets, maxTicketNum, showToast, addActivity, catLabels }) {
+  const [confirmClose, setConfirmClose] = useState(false);
+  const [viewWeek, setViewWeek] = useState(null);
+
+  function buildReport(ticketList) {
+    const perRev = {};
+    let totalCA = 0;
+    ticketList.forEach((t) => {
+      const rid = t.revendeurId || "none";
+      perRev[rid] = perRev[rid] || { heure: 0, jour: 0, deuxJours: 0, semaine: 0, mois: 0, ca: 0, tickets: 0 };
+      const cat = normalizeProfile(t.profile);
+      if (perRev[rid][cat] !== undefined) perRev[rid][cat] += 1;
+      perRev[rid].ca += t.price;
+      perRev[rid].tickets += 1;
+      totalCA += t.price;
+    });
+    const rows = Object.entries(perRev).map(([rid, v]) => ({
+      revendeurId: rid, nom: revendeurs.find((r) => r.id === rid)?.nom || "Non assigné", ...v,
+    })).sort((a, b) => b.ca - a.ca);
+    return { rows, totalCA, totalTickets: ticketList.length };
+  }
+
+  const currentReport = useMemo(() => buildReport(openWeekTickets), [openWeekTickets, revendeurs]);
+
+  function exportWeek(report, weekNumber, weekLabel, ticketRangeLabel, withTotal) {
+    const canvas = drawReportImage({
+      rows: report.rows, totalCA: report.totalCA, totalTickets: report.totalTickets,
+      title: `Rapport Hebdomadaire — Semaine ${weekNumber}`, subtitle: weekLabel, ticketRange: ticketRangeLabel, catLabels,
+      hideTotal: !withTotal,
+    });
+    exportReportImage(canvas, `diafa-semaine-${weekNumber}${withTotal ? "" : "-revendeurs"}.png`, `Rapport Semaine ${weekNumber} — DIAFA WIFIZONE`,
+      "Merci de vérifier votre position et de déposer votre versement auprès de l'agent de recouvrement.", showToast);
+  }
+
+  function closeWeek() {
+    if (openWeekTickets.length === 0) return;
+    const nums = openWeekTickets.map((t) => t.globalId);
+    const dates = openWeekTickets.map((t) => t.date).filter(Boolean);
+    const report = buildReport(openWeekTickets);
+    const week = {
+      id: uid(), weekNumber: weeks.length + 1,
+      startTicket: Math.min(...nums), endTicket: Math.max(...nums),
+      startDate: dates[0] || "", endDate: dates[dates.length - 1] || "",
+      closedAt: Date.now(), ...report,
+    };
+    setWeeks((prev) => [...prev, week]);
+    setConfirmClose(false);
+    addActivity(`Rapport hebdomadaire clôturé (S${week.weekNumber})`, `Tickets ${week.startTicket}–${week.endTicket}`);
+    showToast(`Semaine ${week.weekNumber} clôturée (tickets ${week.startTicket}–${week.endTicket})`);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div className="dz-card" style={{ padding: 18 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 14.5, display: "flex", alignItems: "center", gap: 7 }}>
+              <LockOpen size={15} color={COLORS.accent} /> Semaine en cours — Semaine {weeks.length + 1}
+            </div>
+            <div style={{ fontSize: 12, color: theme.sub, marginTop: 3 }}>
+              Tickets #{lastClosedTicket + 1} → #{maxTicketNum || lastClosedTicket} · {fmtInt(currentReport.totalTickets)} tickets · {GNF(currentReport.totalCA)}
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button className="dz-btn" disabled={openWeekTickets.length === 0}
+              title="Pour le groupe WhatsApp des revendeurs — sans le total"
+              onClick={() => exportWeek(currentReport, weeks.length + 1, "Semaine en cours", `Tickets #${lastClosedTicket + 1} → #${maxTicketNum || lastClosedTicket}`, false)}
+              style={{ background: "transparent", border: `1px solid ${theme.border}`, color: theme.text, padding: "10px 14px", borderRadius: 9, fontWeight: 700, fontSize: 12.5, display: "flex", alignItems: "center", gap: 7, opacity: openWeekTickets.length ? 1 : .5 }}>
+              <Share2 size={14} /> Export revendeurs
+            </button>
+            <button className="dz-btn" disabled={openWeekTickets.length === 0}
+              title="Pour vous / l'agent de recouvrement — avec le total"
+              onClick={() => exportWeek(currentReport, weeks.length + 1, "Semaine en cours", `Tickets #${lastClosedTicket + 1} → #${maxTicketNum || lastClosedTicket}`, true)}
+              style={{ background: "transparent", border: `1px solid ${theme.border}`, color: theme.text, padding: "10px 14px", borderRadius: 9, fontWeight: 700, fontSize: 12.5, display: "flex", alignItems: "center", gap: 7, opacity: openWeekTickets.length ? 1 : .5 }}>
+              <Share2 size={14} /> Export admin (avec total)
+            </button>
+            <button className="dz-btn" disabled={openWeekTickets.length === 0} onClick={() => setConfirmClose(true)}
+              style={{ background: COLORS.secondary, color: "#fff", padding: "10px 18px", borderRadius: 9, fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 7, opacity: openWeekTickets.length ? 1 : .5 }}>
+              <Lock size={14} /> Clôturer la semaine
+            </button>
+          </div>
+        </div>
+
+        <WeekTable rows={currentReport.rows} theme={theme} catLabels={catLabels} />
+      </div>
+
+      <div className="dz-card" style={{ padding: 18 }}>
+        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 12 }}>Semaines clôturées</div>
+        {weeks.length === 0 ? (
+          <div style={{ color: theme.sub, fontSize: 12.5 }}>Aucune semaine clôturée pour le moment.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {[...weeks].reverse().map((w) => (
+              <div key={w.id} className="dz-btn" onClick={() => setViewWeek(w)}
+                style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 14px", borderRadius: 10, border: `1px solid ${theme.border}`, background: dark ? "#0F172A" : "#F8FAFC" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <Lock size={13} color={theme.sub} />
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: 13 }}>Semaine {w.weekNumber}</div>
+                    <div style={{ fontSize: 11.5, color: theme.sub }}>Tickets #{w.startTicket}–#{w.endTicket} · {w.startDate} → {w.endDate}</div>
+                  </div>
+                </div>
+                <div style={{ textAlign: "right", display: "flex", alignItems: "center", gap: 10 }}>
+                  <div>
+                    <div style={{ fontWeight: 700, fontSize: 13 }}>{GNF(w.totalCA)}</div>
+                    <div style={{ fontSize: 11.5, color: theme.sub }}>{fmtInt(w.totalTickets)} tickets</div>
+                  </div>
+                  <button className="dz-btn" title="Exporter en image"
+                    onClick={(e) => { e.stopPropagation(); exportWeek(w, w.weekNumber, `${w.startDate} → ${w.endDate}`, `Tickets #${w.startTicket}–#${w.endTicket}`, true); }}
+                    style={{ background: dark ? "#1E293B" : "#fff", border: `1px solid ${theme.border}`, color: theme.sub, width: 30, height: 30, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                    <Download size={13} />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {confirmClose && (
+        <Modal theme={theme} onClose={() => setConfirmClose(false)} title="Clôturer la semaine ?">
+          <div style={{ fontSize: 13, color: theme.sub, marginBottom: 16, lineHeight: 1.5 }}>
+            Cette action verrouille définitivement les tickets #{lastClosedTicket + 1} à #{maxTicketNum} comme <b>Semaine {weeks.length + 1}</b>.
+            Elle ne pourra plus être recomptée. {fmtInt(currentReport.totalTickets)} tickets pour {GNF(currentReport.totalCA)}.
+          </div>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <button className="dz-btn" onClick={() => setConfirmClose(false)} style={{ background: dark ? "#334155" : "#F1F5F9", color: theme.text, padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600 }}>Annuler</button>
+            <button className="dz-btn" onClick={closeWeek} style={{ background: COLORS.secondary, color: "#fff", padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 700 }}>Confirmer la clôture</button>
+          </div>
+        </Modal>
+      )}
+
+      {viewWeek && (
+        <Modal theme={theme} onClose={() => setViewWeek(null)} title={`Semaine ${viewWeek.weekNumber} — détail`}>
+          <div style={{ fontSize: 11.5, color: theme.sub, marginBottom: 10 }}>Tickets #{viewWeek.startTicket}–#{viewWeek.endTicket} · {viewWeek.startDate} → {viewWeek.endDate}</div>
+          <div style={{ maxHeight: 320, overflowY: "auto", marginBottom: 12 }}><WeekTable rows={viewWeek.rows} theme={theme} compact catLabels={catLabels} /></div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="dz-btn" title="Pour le groupe WhatsApp des revendeurs — sans le total"
+              onClick={() => exportWeek(viewWeek, viewWeek.weekNumber, `${viewWeek.startDate} → ${viewWeek.endDate}`, `Tickets #${viewWeek.startTicket}–#${viewWeek.endTicket}`, false)}
+              style={{ flex: 1, background: "transparent", border: `1px solid ${theme.border}`, color: theme.text, padding: "10px 0", borderRadius: 9, fontWeight: 700, fontSize: 12.5, display: "flex", alignItems: "center", justifyContent: "center", gap: 7 }}>
+              <Share2 size={14} /> Revendeurs
+            </button>
+            <button className="dz-btn" title="Pour vous / l'agent de recouvrement — avec le total"
+              onClick={() => exportWeek(viewWeek, viewWeek.weekNumber, `${viewWeek.startDate} → ${viewWeek.endDate}`, `Tickets #${viewWeek.startTicket}–#${viewWeek.endTicket}`, true)}
+              style={{ flex: 1, background: COLORS.primary, color: "#fff", padding: "10px 0", borderRadius: 9, fontWeight: 700, fontSize: 12.5, display: "flex", alignItems: "center", justifyContent: "center", gap: 7 }}>
+              <Share2 size={14} /> Admin (avec total)
+            </button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function WeekTable({ rows, theme, compact, catLabels }) {
+  const L = { ...CAT_LABEL, ...(catLabels || {}) };
+  if (rows.length === 0) return <div style={{ color: theme.sub, fontSize: 12.5, padding: "16px 0" }}>Aucun ticket dans cette période.</div>;
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <table className="dz-table" style={{ width: "100%", borderCollapse: "collapse", minWidth: compact ? 0 : 560 }}>
+        <thead><tr><th>Revendeur</th><th style={{textAlign:"right"}}>{L.heure}</th><th style={{textAlign:"right"}}>{L.jour}</th><th style={{textAlign:"right"}}>{L.deuxJours}</th><th style={{textAlign:"right"}}>{L.semaine}</th><th style={{textAlign:"right"}}>{L.mois}</th><th style={{textAlign:"right"}}>Tickets</th><th style={{textAlign:"right"}}>CA</th></tr></thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.revendeurId}>
+              <td style={{ fontWeight: 600 }}>{r.nom}</td>
+              <td style={{ textAlign: "right" }}>{r.heure || 0}</td>
+              <td style={{ textAlign: "right" }}>{r.jour || 0}</td>
+              <td style={{ textAlign: "right" }}>{r.deuxJours || 0}</td>
+              <td style={{ textAlign: "right" }}>{r.semaine || 0}</td>
+              <td style={{ textAlign: "right" }}>{r.mois || 0}</td>
+              <td style={{ textAlign: "right" }}>{fmtInt(r.tickets)}</td>
+              <td style={{ textAlign: "right", fontWeight: 700 }}>{GNF(r.ca)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ========================== RAPPORT MENSUEL ============================= */
+const MOIS_LABEL = ["Janvier","Février","Mars","Avril","Mai","Juin","Juillet","Août","Septembre","Octobre","Novembre","Décembre"];
+
+function aggregateWeeks(weeksList) {
+  const perRev = {};
+  let totalCA = 0, totalTickets = 0;
+  weeksList.forEach((w) => {
+    w.rows.forEach((r) => {
+      perRev[r.revendeurId] = perRev[r.revendeurId] || { nom: r.nom, revendeurId: r.revendeurId, heure: 0, jour: 0, deuxJours: 0, semaine: 0, mois: 0, ca: 0, tickets: 0 };
+      const acc = perRev[r.revendeurId];
+      acc.heure += r.heure || 0; acc.jour += r.jour || 0; acc.deuxJours += r.deuxJours || 0;
+      acc.semaine += r.semaine || 0; acc.mois += r.mois || 0; acc.ca += r.ca; acc.tickets += r.tickets;
+    });
+    totalCA += w.totalCA; totalTickets += w.totalTickets;
+  });
+  const rows = Object.values(perRev).sort((a, b) => b.ca - a.ca);
+  return { rows, totalCA, totalTickets };
+}
+
+function RapportMensuel({ theme, dark, weeks, catLabels }) {
+  const months = useMemo(() => {
+    const acc = {};
+    weeks.forEach((w) => {
+      const d = parseMikhmonDate(w.startDate, "00:00:00") || parseMikhmonDate(w.endDate, "00:00:00");
+      if (!d) return;
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      acc[key] = acc[key] || { key, year: d.getFullYear(), month: d.getMonth(), weeks: [] };
+      acc[key].weeks.push(w);
+    });
+    return Object.values(acc).sort((a, b) => (a.key < b.key ? 1 : -1));
+  }, [weeks]);
+
+  const [selectedKey, setSelectedKey] = useState(months[0]?.key || null);
+  const current = months.find((m) => m.key === selectedKey) || months[0];
+  const idxInList = months.findIndex((m) => m.key === current?.key);
+  const previous = months[idxInList + 1]; // months sorted desc, so +1 = previous month
+  const aggregate = aggregateWeeks;
+
+  if (!current) {
+    return (
+      <div className="dz-card" style={{ padding: 30, textAlign: "center", color: theme.sub, fontSize: 13 }}>
+        Aucun rapport mensuel disponible pour le moment — clôturez au moins une semaine dans
+        <b> Rapport Hebdomadaire</b> pour qu'un mois apparaisse ici.
+      </div>
+    );
+  }
+
+  const report = aggregate(current.weeks);
+  const prevReport = previous ? aggregate(previous.weeks) : null;
+  const evolution = prevReport && prevReport.totalCA > 0
+    ? ((report.totalCA - prevReport.totalCA) / prevReport.totalCA) * 100
+    : null;
+
+  const byWeekChart = current.weeks
+    .slice().sort((a, b) => a.weekNumber - b.weekNumber)
+    .map((w) => ({ label: `S${w.weekNumber}`, ca: w.totalCA }));
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+        <select className="dz-input" style={{ width: 220 }} value={current.key} onChange={(e) => setSelectedKey(e.target.value)}>
+          {months.map((m) => <option key={m.key} value={m.key}>{MOIS_LABEL[m.month]} {m.year}</option>)}
+        </select>
+        <div style={{ fontSize: 12, color: theme.sub }}>{current.weeks.length} semaine(s) clôturée(s) dans ce mois</div>
+      </div>
+
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        <KpiCard theme={theme} icon={TrendingUp} color={COLORS.primary} label={`CA ${MOIS_LABEL[current.month]}`} value={GNF(report.totalCA)}
+          sub={evolution !== null ? `${evolution >= 0 ? "+" : ""}${evolution.toFixed(1)}% vs mois précédent` : null} subGood={evolution !== null && evolution >= 0} />
+        <KpiCard theme={theme} icon={Ticket} color={COLORS.secondary} label="Tickets vendus" value={fmtInt(report.totalTickets)} />
+        <KpiCard theme={theme} icon={CalendarRange} color={COLORS.accent} label="Semaines incluses" value={fmtInt(current.weeks.length)} />
+        <KpiCard theme={theme} icon={Users} color="#8B5CF6" label="Revendeurs actifs" value={fmtInt(report.rows.length)} />
+      </div>
+
+      <div className="dz-card" style={{ padding: 18 }}>
+        <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 12 }}>CA par semaine — {MOIS_LABEL[current.month]} {current.year}</div>
+        <ResponsiveContainer width="100%" height={200}>
+          <BarChart data={byWeekChart}>
+            <CartesianGrid strokeDasharray="3 3" stroke={theme.border} vertical={false} />
+            <XAxis dataKey="label" tick={{ fontSize: 11, fill: theme.sub }} axisLine={false} tickLine={false} />
+            <YAxis tick={{ fontSize: 11, fill: theme.sub }} axisLine={false} tickLine={false} width={40} tickFormatter={(v) => (v >= 1000 ? v / 1000 + "k" : v)} />
+            <Tooltip formatter={(v) => GNF(v)} contentStyle={{ borderRadius: 10, border: `1px solid ${theme.border}`, fontSize: 12 }} />
+            <Bar dataKey="ca" fill={COLORS.primary} radius={[6, 6, 0, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div className="dz-card" style={{ padding: 18 }}>
+        <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 12 }}>Détail par revendeur — {MOIS_LABEL[current.month]} {current.year}</div>
+        <WeekTable rows={report.rows} theme={theme} catLabels={catLabels} />
+      </div>
+    </div>
+  );
+}
+
+/* ========================== RAPPORT ANNUEL =============================== */
+const CAT_KEYS = ["heure", "jour", "deuxJours", "semaine", "mois"];
+
+function RapportAnnuel({ theme, dark, weeks, catLabels }) {
+  const years = useMemo(() => {
+    const acc = {};
+    weeks.forEach((w) => {
+      const d = parseMikhmonDate(w.startDate, "00:00:00") || parseMikhmonDate(w.endDate, "00:00:00");
+      if (!d) return;
+      const y = d.getFullYear();
+      acc[y] = acc[y] || [];
+      acc[y].push(w);
+    });
+    return Object.entries(acc)
+      .map(([year, ws]) => ({ year: parseInt(year, 10), weeks: ws }))
+      .sort((a, b) => b.year - a.year);
+  }, [weeks]);
+
+  const [selectedYear, setSelectedYear] = useState(years[0]?.year || null);
+  const current = years.find((y) => y.year === selectedYear) || years[0];
+
+  if (!current) {
+    return (
+      <div className="dz-card" style={{ padding: 30, textAlign: "center", color: theme.sub, fontSize: 13 }}>
+        Aucun rapport annuel disponible pour le moment — clôturez au moins une semaine dans
+        <b> Rapport Hebdomadaire</b> pour qu'une année apparaisse ici.
+      </div>
+    );
+  }
+
+  const report = aggregateWeeks(current.weeks);
+
+  const monthly = useMemo(() => {
+    const acc = Array.from({ length: 12 }, (_, i) => ({ month: i, label: MOIS_LABEL[i].slice(0, 3), ca: 0, tickets: 0, hasData: false }));
+    current.weeks.forEach((w) => {
+      const d = parseMikhmonDate(w.startDate, "00:00:00") || parseMikhmonDate(w.endDate, "00:00:00");
+      if (!d) return;
+      acc[d.getMonth()].ca += w.totalCA;
+      acc[d.getMonth()].tickets += w.totalTickets;
+      acc[d.getMonth()].hasData = true;
+    });
+    return acc;
+  }, [current]);
+
+  const withData = monthly.filter((m) => m.hasData);
+  const bestMonth = withData.length ? withData.reduce((a, b) => (b.ca > a.ca ? b : a)) : null;
+  const worstMonth = withData.length ? withData.reduce((a, b) => (b.ca < a.ca ? b : a)) : null;
+  const bestRevendeur = report.rows[0] || null;
+
+  const profilTotals = CAT_KEYS.map((k) => ({
+    key: k, label: (catLabels && catLabels[k]) || CAT_LABEL[k],
+    tickets: report.rows.reduce((s, r) => s + (r[k] || 0), 0),
+  }));
+  const bestProfil = profilTotals.reduce((a, b) => (b.tickets > a.tickets ? b : a), profilTotals[0]);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+        <select className="dz-input" style={{ width: 160 }} value={current.year} onChange={(e) => setSelectedYear(parseInt(e.target.value, 10))}>
+          {years.map((y) => <option key={y.year} value={y.year}>{y.year}</option>)}
+        </select>
+        <div style={{ fontSize: 12, color: theme.sub }}>{current.weeks.length} semaine(s) clôturée(s) sur {current.year}</div>
+      </div>
+
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        <KpiCard theme={theme} icon={TrendingUp} color={COLORS.primary} label={`CA ${current.year}`} value={GNF(report.totalCA)} />
+        <KpiCard theme={theme} icon={Ticket} color={COLORS.secondary} label="Tickets vendus" value={fmtInt(report.totalTickets)} />
+        <KpiCard theme={theme} icon={Users} color="#8B5CF6" label="Revendeurs actifs" value={fmtInt(report.rows.length)} />
+        <KpiCard theme={theme} icon={CalendarRange} color={COLORS.accent} label="Semaines clôturées" value={fmtInt(current.weeks.length)} />
+      </div>
+
+      <div className="dz-card" style={{ padding: 18 }}>
+        <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 12 }}>Évolution mensuelle — {current.year}</div>
+        <ResponsiveContainer width="100%" height={220}>
+          <BarChart data={monthly}>
+            <CartesianGrid strokeDasharray="3 3" stroke={theme.border} vertical={false} />
+            <XAxis dataKey="label" tick={{ fontSize: 11, fill: theme.sub }} axisLine={false} tickLine={false} />
+            <YAxis tick={{ fontSize: 11, fill: theme.sub }} axisLine={false} tickLine={false} width={40} tickFormatter={(v) => (v >= 1000 ? v / 1000 + "k" : v)} />
+            <Tooltip formatter={(v) => GNF(v)} contentStyle={{ borderRadius: 10, border: `1px solid ${theme.border}`, fontSize: 12 }} />
+            <Bar dataKey="ca" fill={COLORS.primary} radius={[6, 6, 0, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+        <HighlightCard theme={theme} dark={dark} icon={Trophy} color={COLORS.secondary}
+          label="Meilleur mois" value={bestMonth ? `${MOIS_LABEL[bestMonth.month]}` : "—"} sub={bestMonth ? GNF(bestMonth.ca) : ""} />
+        <HighlightCard theme={theme} dark={dark} icon={TrendingDown} color={COLORS.danger}
+          label="Mois le plus faible" value={worstMonth ? `${MOIS_LABEL[worstMonth.month]}` : "—"} sub={worstMonth ? GNF(worstMonth.ca) : ""} />
+        <HighlightCard theme={theme} dark={dark} icon={Award} color={COLORS.accent}
+          label="Meilleur revendeur" value={bestRevendeur ? bestRevendeur.nom : "—"} sub={bestRevendeur ? GNF(bestRevendeur.ca) : ""} />
+        <HighlightCard theme={theme} dark={dark} icon={Ticket} color="#8B5CF6"
+          label="Profil le plus vendu" value={bestProfil ? bestProfil.label : "—"} sub={bestProfil ? `${fmtInt(bestProfil.tickets)} tickets` : ""} />
+      </div>
+
+      <div className="dz-card" style={{ padding: 18 }}>
+        <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 12 }}>Détail par revendeur — {current.year}</div>
+        <WeekTable rows={report.rows} theme={theme} catLabels={catLabels} />
+      </div>
+    </div>
+  );
+}
+
+function HighlightCard({ theme, dark, icon: Icon, color, label, value, sub }) {
+  return (
+    <div className="dz-card" style={{ flex: "1 1 220px", padding: 16, display: "flex", alignItems: "center", gap: 12 }}>
+      <div style={{ width: 40, height: 40, borderRadius: 11, background: color + "1a", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+        <Icon size={19} color={color} />
+      </div>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: 11.5, color: theme.sub, fontWeight: 600 }}>{label}</div>
+        <div style={{ fontSize: 15, fontWeight: 800, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{value}</div>
+        {sub && <div style={{ fontSize: 11.5, color: theme.sub }}>{sub}</div>}
+      </div>
+    </div>
+  );
+}
+
+/* ========================== CLASSEMENTS =================================== */
+const RANK_COLORS = ["#F59E0B", "#94A3B8", "#B45309"]; // or / argent / bronze
+
+function buildRanking(ticketList, revendeurs) {
+  const acc = {};
+  let totalCA = 0;
+  ticketList.forEach((t) => {
+    const rid = t.revendeurId || "none";
+    acc[rid] = acc[rid] || { revendeurId: rid, tickets: 0, ca: 0, heure: 0, jour: 0, deuxJours: 0, semaine: 0, mois: 0 };
+    const cat = normalizeProfile(t.profile);
+    if (acc[rid][cat] !== undefined) acc[rid][cat] += 1;
+    acc[rid].tickets += 1;
+    acc[rid].ca += t.price;
+    totalCA += t.price;
+  });
+  const rows = Object.values(acc)
+    .map((r) => {
+      const rev = revendeurs.find((x) => x.id === r.revendeurId);
+      return { ...r, nom: rev ? rev.nom : "Non assigné", couleur: rev ? rev.couleur : "#94A3B8" };
+    })
+    .sort((a, b) => b.ca - a.ca)
+    .map((r, i) => ({ ...r, rank: i + 1, pct: totalCA > 0 ? (r.ca / totalCA) * 100 : 0 }));
+  return { rows, totalCA, totalTickets: ticketList.length };
+}
+
+function Classements({ theme, dark, tickets, revendeurs, openWeekTickets, lastClosedTicket, weeks, meta, catLabels, showToast, currentUser }) {
+  const isRevendeurViewer = currentUser && currentUser.role === "revendeur";
+  const myRevendeurId = currentUser && currentUser.revendeurId;
+  const [tab, setTab] = useState("semaine");
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    const id = window.setInterval(() => forceTick((n) => n + 1), 60000); // refresh "il y a X min" every minute
+    return () => window.clearInterval(id);
+  }, []);
+
+  const now = new Date();
+  const withDate = useMemo(
+    () => tickets.map((t) => ({ ...t, _d: parseMikhmonDate(t.date, t.time) })).filter((t) => t._d),
+    [tickets]
+  );
+  const moisTickets = useMemo(
+    () => withDate.filter((t) => t._d.getMonth() === now.getMonth() && t._d.getFullYear() === now.getFullYear()),
+    [withDate]
+  );
+  const anneeTickets = useMemo(
+    () => withDate.filter((t) => t._d.getFullYear() === now.getFullYear()),
+    [withDate]
+  );
+
+  const dataFor = {
+    semaine: { list: openWeekTickets, title: `Semaine en cours (tickets #${lastClosedTicket + 1}+)`, note: "Se met à jour à chaque import — utile pour la prime hebdomadaire." },
+    mois: { list: moisTickets, title: now.toLocaleDateString("fr-FR", { month: "long", year: "numeric" }), note: "Cumul de toutes les ventes du mois en cours, importées à ce jour." },
+    annee: { list: anneeTickets, title: `Année ${now.getFullYear()}`, note: "Cumul de toutes les ventes de l'année en cours." },
+  };
+  const active = dataFor[tab];
+  const ranking = useMemo(() => buildRanking(active.list, revendeurs), [active.list, revendeurs]);
+  const top3 = ranking.rows.slice(0, 3);
+  const rest = ranking.rows.slice(3);
+  const maxCA = Math.max(1, ...ranking.rows.map((r) => r.ca));
+
+  const myRow = myRevendeurId ? ranking.rows.find((r) => r.revendeurId === myRevendeurId) : null;
+  const aboveRow = myRow && myRow.rank > 1 ? ranking.rows.find((r) => r.rank === myRow.rank - 1) : null;
+
+  function exportRanking(withTotal) {
+    const forced = isRevendeurViewer ? false : withTotal; // revendeurs can never produce a "with total" export
+    const canvas = drawReportImage({
+      rows: ranking.rows.map((r) => ({ ...r, nom: `${r.rank}. ${r.nom}` })),
+      totalCA: ranking.totalCA, totalTickets: ranking.totalTickets,
+      title: `Classement — ${active.title}`,
+      subtitle: "Nombre de tickets vendus par forfait et par revendeur",
+      ticketRange: meta && meta.lastImportDate ? `Mis à jour ${timeAgo(meta.lastImportDate)}` : "",
+      catLabels,
+      hideTotal: !forced,
+    });
+    exportReportImage(canvas, `diafa-classement-${tab}${forced ? "" : "-revendeurs"}.png`, `Classement ${active.title} — DIAFA WIFIZONE`,
+      "Voici le classement actuel — continuez sur votre lancée ou améliorez votre position !", showToast);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+        <div style={{ display: "flex", gap: 3, background: dark ? "#0F172A" : "#F1F5F9", padding: 3, borderRadius: 10, width: "fit-content" }}>
+          {[["semaine", "Semaine en cours"], ["mois", "Ce mois"], ["annee", "Cette année"]].map(([id, label]) => (
+            <button key={id} className="dz-btn" onClick={() => setTab(id)}
+              style={{ padding: "8px 14px", borderRadius: 8, fontSize: 12.5, fontWeight: 700, background: tab === id ? COLORS.primary : "transparent", color: tab === id ? "#fff" : theme.sub }}>
+              {label}
+            </button>
+          ))}
+        </div>
+        {meta && meta.lastImportDate && (
+          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: theme.sub }}>
+            <span style={{ width: 7, height: 7, borderRadius: 99, background: COLORS.secondary, display: "inline-block" }} />
+            Dernière mise à jour : {timeAgo(meta.lastImportDate)}
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
+        {isRevendeurViewer ? (
+          <button className="dz-btn" disabled={ranking.rows.length === 0} onClick={() => exportRanking(false)}
+            style={{ background: "transparent", border: `1px solid ${theme.border}`, color: theme.text, padding: "9px 14px", borderRadius: 9, fontWeight: 700, fontSize: 12.5, display: "flex", alignItems: "center", gap: 7, opacity: ranking.rows.length ? 1 : .5 }}>
+            <Share2 size={13} /> Exporter / Partager
+          </button>
+        ) : (
+          <>
+            <button className="dz-btn" disabled={ranking.rows.length === 0} onClick={() => exportRanking(false)}
+              title="Pour le groupe WhatsApp des revendeurs — sans le total"
+              style={{ background: "transparent", border: `1px solid ${theme.border}`, color: theme.text, padding: "9px 14px", borderRadius: 9, fontWeight: 700, fontSize: 12.5, display: "flex", alignItems: "center", gap: 7, opacity: ranking.rows.length ? 1 : .5 }}>
+              <Share2 size={13} /> Export revendeurs
+            </button>
+            <button className="dz-btn" disabled={ranking.rows.length === 0} onClick={() => exportRanking(true)}
+              title="Pour vous / l'agent de recouvrement — avec le total"
+              style={{ background: "transparent", border: `1px solid ${theme.border}`, color: theme.text, padding: "9px 14px", borderRadius: 9, fontWeight: 700, fontSize: 12.5, display: "flex", alignItems: "center", gap: 7, opacity: ranking.rows.length ? 1 : .5 }}>
+              <Share2 size={13} /> Export admin (avec total)
+            </button>
+          </>
+        )}
+      </div>
+
+      <div className="dz-card" style={{ padding: 14, display: "flex", alignItems: "center", gap: 10, background: COLORS.accent + "12", border: `1px solid ${COLORS.accent}33` }}>
+        <Trophy size={17} color={COLORS.accent} style={{ flexShrink: 0 }} />
+        <div style={{ fontSize: 12.5, color: theme.text }}>
+          <b>{active.title}</b> — {active.note}
+        </div>
+      </div>
+
+      {myRow && (
+        <div className="dz-card" style={{ padding: 18, background: `linear-gradient(135deg, ${COLORS.primary}10, ${COLORS.secondary}10)`, border: `1.5px solid ${COLORS.primary}44` }}>
+          <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.primary, marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}>
+            <Award size={14} /> MA POSITION
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+            <div style={{
+              width: 48, height: 48, borderRadius: 99, display: "flex", alignItems: "center", justifyContent: "center",
+              background: (myRow.rank <= 3 ? RANK_COLORS[myRow.rank - 1] : COLORS.primary) + "22",
+              color: myRow.rank <= 3 ? RANK_COLORS[myRow.rank - 1] : COLORS.primary, fontWeight: 800, fontSize: 20, flexShrink: 0,
+              border: `2px solid ${myRow.rank <= 3 ? RANK_COLORS[myRow.rank - 1] : COLORS.primary}`,
+            }}>{myRow.rank}</div>
+            <div style={{ flex: "1 1 160px" }}>
+              <div style={{ fontWeight: 700, fontSize: 15 }}>{myRow.nom}</div>
+              <div style={{ fontSize: 12, color: theme.sub }}>{fmtInt(myRow.tickets)} tickets vendus · {myRow.pct.toFixed(1)}% de votre part sur cette période</div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 18, fontWeight: 800, color: COLORS.primary }}>{GNF(myRow.ca)}</div>
+              <div style={{ fontSize: 11, color: theme.sub }}>vos ventes</div>
+            </div>
+          </div>
+          {aboveRow && (
+            <div style={{ marginTop: 12, padding: "9px 12px", borderRadius: 9, background: dark ? "#0F172A" : "#fff", fontSize: 12, color: theme.text, display: "flex", alignItems: "center", gap: 7 }}>
+              <TrendingUp size={14} color={COLORS.accent} />
+              Il vous manque <b style={{ margin: "0 4px" }}>{GNF(aboveRow.ca - myRow.ca)}</b> pour dépasser <b>{aboveRow.nom}</b> (rang {aboveRow.rank}) !
+            </div>
+          )}
+          {!aboveRow && myRow.rank === 1 && (
+            <div style={{ marginTop: 12, padding: "9px 12px", borderRadius: 9, background: dark ? "#0F172A" : "#fff", fontSize: 12, color: COLORS.secondary, fontWeight: 700, display: "flex", alignItems: "center", gap: 7 }}>
+              <Trophy size={14} /> Vous êtes en tête ! Continuez comme ça.
+            </div>
+          )}
+        </div>
+      )}
+
+      {ranking.rows.length === 0 ? (
+        <div className="dz-card" style={{ padding: 30, textAlign: "center", color: theme.sub, fontSize: 13 }}>
+          Aucune vente enregistrée sur cette période pour le moment.
+        </div>
+      ) : (
+        <>
+          {/* Podium top 3 */}
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+            {top3.map((r) => (
+              <div key={r.revendeurId} className="dz-card" style={{
+                flex: "1 1 220px", padding: 18, textAlign: "center", position: "relative",
+                border: r.revendeurId === myRevendeurId ? `2px solid ${COLORS.primary}` : `1.5px solid ${RANK_COLORS[r.rank - 1]}55`,
+                boxShadow: r.revendeurId === myRevendeurId ? `0 0 0 3px ${COLORS.primary}18` : "none",
+              }}>
+                {r.revendeurId === myRevendeurId && (
+                  <span style={{ position: "absolute", top: 8, right: 8, fontSize: 9.5, fontWeight: 800, color: COLORS.primary, background: COLORS.primary + "18", padding: "2px 7px", borderRadius: 99 }}>VOUS</span>
+                )}
+                <div style={{
+                  width: 44, height: 44, borderRadius: 99, margin: "0 auto 10px", display: "flex", alignItems: "center", justifyContent: "center",
+                  background: RANK_COLORS[r.rank - 1] + "22", color: RANK_COLORS[r.rank - 1], fontWeight: 800, fontSize: 18, border: `2px solid ${RANK_COLORS[r.rank - 1]}`,
+                }}>
+                  {r.rank}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, marginBottom: 4 }}>
+                  <span style={{ width: 8, height: 8, borderRadius: 99, background: r.couleur }} />
+                  <div style={{ fontWeight: 700, fontSize: 14.5 }}>{r.nom}</div>
+                </div>
+                <div style={{ fontSize: 17, fontWeight: 800, color: RANK_COLORS[r.rank - 1] }}>{GNF(r.ca)}</div>
+                <div style={{ fontSize: 11.5, color: theme.sub, marginTop: 3 }}>{fmtInt(r.tickets)} tickets · {r.pct.toFixed(1)}% des ventes</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Full ranking */}
+          <div className="dz-card" style={{ padding: 18 }}>
+            <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 14 }}>Classement complet — {active.title}</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {ranking.rows.map((r) => (
+                <div key={r.revendeurId} style={r.revendeurId === myRevendeurId ? { background: COLORS.primary + "0c", borderRadius: 10, padding: "6px 8px", margin: "-6px -8px" } : undefined}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 5 }}>
+                    <span style={{
+                      width: 22, height: 22, borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center",
+                      fontSize: 11, fontWeight: 800, flexShrink: 0,
+                      background: r.rank <= 3 ? RANK_COLORS[r.rank - 1] + "22" : (dark ? "#334155" : "#F1F5F9"),
+                      color: r.rank <= 3 ? RANK_COLORS[r.rank - 1] : theme.sub,
+                    }}>{r.rank}</span>
+                    <span style={{ width: 7, height: 7, borderRadius: 99, background: r.couleur, flexShrink: 0 }} />
+                    <span style={{ fontWeight: 600, fontSize: 13, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.nom}{r.revendeurId === myRevendeurId ? " (vous)" : ""}</span>
+                    <span style={{ fontSize: 11.5, color: theme.sub, whiteSpace: "nowrap" }}>{fmtInt(r.tickets)} tickets</span>
+                    <span style={{ fontWeight: 700, fontSize: 13, whiteSpace: "nowrap", minWidth: 90, textAlign: "right" }}>{GNF(r.ca)}</span>
+                  </div>
+                  <div style={{ height: 6, borderRadius: 99, background: dark ? "#334155" : "#EEF2FF", marginLeft: 32 }}>
+                    <div style={{ height: 6, borderRadius: 99, width: `${(r.ca / maxCA) * 100}%`, background: r.rank <= 3 ? RANK_COLORS[r.rank - 1] : COLORS.primary }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Detail per category — where each reseller is strong/weak */}
+          <div className="dz-card" style={{ padding: 18 }}>
+            <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>Détail par forfait vendu — {active.title}</div>
+            <div style={{ fontSize: 11.5, color: theme.sub, marginBottom: 14 }}>
+              Chaque revendeur peut voir où il vend bien et où il doit progresser.
+            </div>
+            <WeekTable
+              rows={ranking.rows.map((r) => ({ ...r, nom: `${r.rank}. ${r.nom}` }))}
+              theme={theme}
+              catLabels={catLabels}
+            />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ========================== STATISTIQUES =================================== */
+const JOUR_LABEL = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"];
+
+function Statistiques({ theme, dark, tickets, revendeurs, catLabels }) {
+  const withDate = useMemo(
+    () => tickets.map((t) => ({ ...t, _d: parseMikhmonDate(t.date, t.time) })).filter((t) => t._d),
+    [tickets]
+  );
+  const now = new Date();
+
+  const sumCA = (list) => list.reduce((s, t) => s + t.price, 0);
+
+  const thisMonth = withDate.filter((t) => t._d.getMonth() === now.getMonth() && t._d.getFullYear() === now.getFullYear());
+  const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const lastMonth = withDate.filter((t) => t._d.getMonth() === lastMonthDate.getMonth() && t._d.getFullYear() === lastMonthDate.getFullYear());
+  const thisYear = withDate.filter((t) => t._d.getFullYear() === now.getFullYear());
+  const lastYear = withDate.filter((t) => t._d.getFullYear() === now.getFullYear() - 1);
+
+  const growth = (curr, prev) => (sumCA(prev) > 0 ? ((sumCA(curr) - sumCA(prev)) / sumCA(prev)) * 100 : null);
+  const growthMonth = growth(thisMonth, lastMonth);
+  const growthYear = growth(thisYear, lastYear);
+
+  const byHour = useMemo(() => {
+    const acc = Array.from({ length: 24 }, (_, h) => ({ label: String(h).padStart(2, "0") + "h", ca: 0, tickets: 0 }));
+    withDate.forEach((t) => { acc[t._d.getHours()].ca += t.price; acc[t._d.getHours()].tickets += 1; });
+    return acc;
+  }, [withDate]);
+
+  const byWeekday = useMemo(() => {
+    const acc = Array.from({ length: 7 }, (_, i) => ({ label: JOUR_LABEL[i], ca: 0, tickets: 0 }));
+    withDate.forEach((t) => { const idx = (t._d.getDay() + 6) % 7; acc[idx].ca += t.price; acc[idx].tickets += 1; });
+    return acc;
+  }, [withDate]);
+
+  const [repartPeriod, setRepartPeriod] = useState("mois");
+  const repartSource = repartPeriod === "mois" ? thisMonth : repartPeriod === "annee" ? thisYear : withDate;
+  const byRevendeur = useMemo(() => {
+    const acc = {};
+    repartSource.forEach((t) => {
+      const rid = t.revendeurId || "none";
+      acc[rid] = acc[rid] || { ca: 0, tickets: 0 };
+      acc[rid].ca += t.price; acc[rid].tickets += 1;
+    });
+    const total = Object.values(acc).reduce((s, v) => s + v.ca, 0);
+    return Object.entries(acc)
+      .map(([rid, v]) => ({ nom: revendeurs.find((r) => r.id === rid)?.nom || "Non assigné", couleur: revendeurs.find((r) => r.id === rid)?.couleur || "#94A3B8", ...v, pct: total ? (v.ca / total) * 100 : 0 }))
+      .sort((a, b) => b.ca - a.ca);
+  }, [repartSource, revendeurs]);
+
+  const byProfil = useMemo(() => {
+    const acc = {};
+    repartSource.forEach((t) => { const c = normalizeProfile(t.profile); acc[c] = acc[c] || { ca: 0, tickets: 0 }; acc[c].ca += t.price; acc[c].tickets += 1; });
+    const total = Object.values(acc).reduce((s, v) => s + v.ca, 0);
+    return Object.entries(acc).map(([k, v]) => ({ name: (catLabels && catLabels[k]) || CAT_LABEL[k] || k, ...v, pct: total ? (v.ca / total) * 100 : 0 })).sort((a, b) => b.ca - a.ca);
+  }, [repartSource]);
+
+  const PIE_COLORS = [COLORS.primary, COLORS.secondary, COLORS.accent, "#8B5CF6", COLORS.danger, "#64748B"];
+
+  // Comparaison entre deux périodes (mois)
+  const monthOptions = useMemo(() => {
+    const acc = {};
+    withDate.forEach((t) => {
+      const key = `${t._d.getFullYear()}-${String(t._d.getMonth() + 1).padStart(2, "0")}`;
+      acc[key] = acc[key] || { key, year: t._d.getFullYear(), month: t._d.getMonth() };
+    });
+    return Object.values(acc).sort((a, b) => (a.key < b.key ? 1 : -1));
+  }, [withDate]);
+  const [cmpA, setCmpA] = useState(monthOptions[1]?.key || monthOptions[0]?.key || "");
+  const [cmpB, setCmpB] = useState(monthOptions[0]?.key || "");
+  const dataForKey = (key) => withDate.filter((t) => `${t._d.getFullYear()}-${String(t._d.getMonth() + 1).padStart(2, "0")}` === key);
+  const cmpAList = dataForKey(cmpA), cmpBList = dataForKey(cmpB);
+  const cmpDelta = sumCA(cmpAList) > 0 ? ((sumCA(cmpBList) - sumCA(cmpAList)) / sumCA(cmpAList)) * 100 : null;
+  const labelForKey = (key) => { const m = monthOptions.find((m) => m.key === key); return m ? `${MOIS_LABEL[m.month]} ${m.year}` : key; };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        <KpiCard theme={theme} icon={TrendingUp} color={COLORS.primary} label="CA ce mois" value={GNF(sumCA(thisMonth))}
+          sub={growthMonth !== null ? `${growthMonth >= 0 ? "+" : ""}${growthMonth.toFixed(1)}% vs mois dernier` : "Pas de données mois dernier"} subGood={growthMonth !== null && growthMonth >= 0} />
+        <KpiCard theme={theme} icon={BarChart3} color={COLORS.secondary} label="CA cette année" value={GNF(sumCA(thisYear))}
+          sub={growthYear !== null ? `${growthYear >= 0 ? "+" : ""}${growthYear.toFixed(1)}% vs année dernière` : "Pas de données année dernière"} subGood={growthYear !== null && growthYear >= 0} />
+        <KpiCard theme={theme} icon={Ticket} color={COLORS.accent} label="Tickets (tout historique)" value={fmtInt(tickets.length)} />
+        <KpiCard theme={theme} icon={Users} color="#8B5CF6" label="Revendeurs avec ventes" value={fmtInt(byRevendeur.length)} />
+      </div>
+
+      <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+        <div className="dz-card" style={{ flex: "1 1 380px", padding: 18 }}>
+          <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 12 }}>Ventes par heure de la journée</div>
+          <ResponsiveContainer width="100%" height={190}>
+            <BarChart data={byHour}>
+              <CartesianGrid strokeDasharray="3 3" stroke={theme.border} vertical={false} />
+              <XAxis dataKey="label" tick={{ fontSize: 9.5, fill: theme.sub }} axisLine={false} tickLine={false} interval={2} />
+              <YAxis tick={{ fontSize: 11, fill: theme.sub }} axisLine={false} tickLine={false} width={36} tickFormatter={(v) => (v >= 1000 ? v / 1000 + "k" : v)} />
+              <Tooltip formatter={(v) => GNF(v)} contentStyle={{ borderRadius: 10, border: `1px solid ${theme.border}`, fontSize: 12 }} />
+              <Bar dataKey="ca" fill={COLORS.primary} radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+        <div className="dz-card" style={{ flex: "1 1 300px", padding: 18 }}>
+          <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 12 }}>Ventes par jour de la semaine</div>
+          <ResponsiveContainer width="100%" height={190}>
+            <BarChart data={byWeekday}>
+              <CartesianGrid strokeDasharray="3 3" stroke={theme.border} vertical={false} />
+              <XAxis dataKey="label" tick={{ fontSize: 11, fill: theme.sub }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fontSize: 11, fill: theme.sub }} axisLine={false} tickLine={false} width={36} tickFormatter={(v) => (v >= 1000 ? v / 1000 + "k" : v)} />
+              <Tooltip formatter={(v) => GNF(v)} contentStyle={{ borderRadius: 10, border: `1px solid ${theme.border}`, fontSize: 12 }} />
+              <Bar dataKey="ca" fill={COLORS.secondary} radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      <div className="dz-card" style={{ padding: 18 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 8 }}>
+          <div style={{ fontWeight: 700, fontSize: 13.5 }}>Répartition des ventes</div>
+          <div style={{ display: "flex", gap: 3, background: dark ? "#0F172A" : "#F1F5F9", padding: 3, borderRadius: 9 }}>
+            {[["semaine", "Global"], ["mois", "Ce mois"], ["annee", "Cette année"]].map(([id, label]) => (
+              <button key={id} className="dz-btn" onClick={() => setRepartPeriod(id)}
+                style={{ padding: "6px 11px", borderRadius: 7, fontSize: 11.5, fontWeight: 700, background: repartPeriod === id ? COLORS.primary : "transparent", color: repartPeriod === id ? "#fff" : theme.sub }}>{label}</button>
+            ))}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 260px" }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: theme.sub, marginBottom: 10 }}>Par revendeur</div>
+            {byRevendeur.length === 0 && <div style={{ fontSize: 12.5, color: theme.sub }}>Aucune donnée.</div>}
+            {byRevendeur.slice(0, 8).map((r, i) => (
+              <div key={i} style={{ marginBottom: 9 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
+                  <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 7, height: 7, borderRadius: 99, background: r.couleur }} />{r.nom}</span>
+                  <span style={{ fontWeight: 700 }}>{r.pct.toFixed(1)}%</span>
+                </div>
+                <div style={{ height: 5, borderRadius: 99, background: dark ? "#334155" : "#EEF2FF" }}>
+                  <div style={{ height: 5, borderRadius: 99, width: `${r.pct}%`, background: r.couleur }} />
+                </div>
+              </div>
+            ))}
+          </div>
+          <div style={{ flex: "1 1 220px" }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: theme.sub, marginBottom: 10 }}>Par profil</div>
+            {byProfil.length === 0 ? <div style={{ fontSize: 12.5, color: theme.sub }}>Aucune donnée.</div> : (
+              <ResponsiveContainer width="100%" height={160}>
+                <PieChart>
+                  <Pie data={byProfil} dataKey="ca" nameKey="name" innerRadius={38} outerRadius={62} paddingAngle={2}>
+                    {byProfil.map((_, i) => <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}
+                  </Pie>
+                  <Tooltip formatter={(v) => GNF(v)} contentStyle={{ borderRadius: 10, fontSize: 12 }} />
+                </PieChart>
+              </ResponsiveContainer>
+            )}
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 4, justifyContent: "center" }}>
+              {byProfil.map((c, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: theme.sub }}>
+                  <span style={{ width: 8, height: 8, borderRadius: 99, background: PIE_COLORS[i % PIE_COLORS.length] }} />{c.name}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="dz-card" style={{ padding: 18 }}>
+        <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 12 }}>Comparaison entre deux périodes</div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
+          <select className="dz-input" style={{ width: 180 }} value={cmpA} onChange={(e) => setCmpA(e.target.value)}>
+            {monthOptions.map((m) => <option key={m.key} value={m.key}>{MOIS_LABEL[m.month]} {m.year}</option>)}
+          </select>
+          <div style={{ display: "flex", alignItems: "center", color: theme.sub, fontSize: 12 }}>vs</div>
+          <select className="dz-input" style={{ width: 180 }} value={cmpB} onChange={(e) => setCmpB(e.target.value)}>
+            {monthOptions.map((m) => <option key={m.key} value={m.key}>{MOIS_LABEL[m.month]} {m.year}</option>)}
+          </select>
+        </div>
+        {monthOptions.length < 1 ? (
+          <div style={{ fontSize: 12.5, color: theme.sub }}>Importez des ventes sur au moins deux mois pour comparer.</div>
+        ) : (
+          <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center" }}>
+            <div style={{ flex: "1 1 160px" }}>
+              <div style={{ fontSize: 11.5, color: theme.sub, fontWeight: 600 }}>{labelForKey(cmpA)}</div>
+              <div style={{ fontSize: 19, fontWeight: 800 }}>{GNF(sumCA(cmpAList))}</div>
+              <div style={{ fontSize: 11.5, color: theme.sub }}>{fmtInt(cmpAList.length)} tickets</div>
+            </div>
+            <div style={{ fontSize: 20, color: theme.sub }}>→</div>
+            <div style={{ flex: "1 1 160px" }}>
+              <div style={{ fontSize: 11.5, color: theme.sub, fontWeight: 600 }}>{labelForKey(cmpB)}</div>
+              <div style={{ fontSize: 19, fontWeight: 800 }}>{GNF(sumCA(cmpBList))}</div>
+              <div style={{ fontSize: 11.5, color: theme.sub }}>{fmtInt(cmpBList.length)} tickets</div>
+            </div>
+            {cmpDelta !== null && (
+              <div style={{
+                padding: "8px 14px", borderRadius: 10, fontWeight: 800, fontSize: 14,
+                background: (cmpDelta >= 0 ? COLORS.secondary : COLORS.danger) + "18",
+                color: cmpDelta >= 0 ? COLORS.secondary : COLORS.danger,
+              }}>
+                {cmpDelta >= 0 ? "+" : ""}{cmpDelta.toFixed(1)}%
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ========================== SAUVEGARDE ==================================== */
+function activityType(text) {
+  const t = (text || "").toLowerCase();
+  if (t.includes("import")) return { label: "Import", color: COLORS.primary };
+  if (t.includes("revendeur")) return { label: "Revendeurs", color: COLORS.secondary };
+  if (t.includes("tarif")) return { label: "Tarifs", color: COLORS.accent };
+  if (t.includes("semaine") || t.includes("rapport")) return { label: "Rapport", color: "#8B5CF6" };
+  if (t.includes("réinitialis") || t.includes("supprim") || t.includes("restaur") || t.includes("sauvegard")) return { label: "Système", color: COLORS.danger };
+  return { label: "Autre", color: "#64748B" };
+}
+
+function Sauvegarde({ theme, dark, showToast, addActivity, revendeurs, setRevendeurs, tarifs, setTarifs, catLabels, setCatLabels, tickets, setTickets, weeks, setWeeks, meta, setMeta, activities, setActivities }) {
+  const [lastBackup, setLastBackup] = useState(null);
+  const [confirmRestore, setConfirmRestore] = useState(null); // parsed backup object, pending confirmation
+  const fileRef = useRef(null);
+
+  useEffect(() => { loadKey("diafa:lastBackupDate", null).then(setLastBackup); }, []);
+
+  const dataSizeKB = useMemo(() => {
+    try {
+      const blob = JSON.stringify({ revendeurs, tarifs, catLabels, tickets, weeks, meta, activities });
+      return Math.round(new Blob([blob]).size / 1024);
+    } catch { return 0; }
+  }, [revendeurs, tarifs, catLabels, tickets, weeks, meta, activities]);
+
+  function downloadBackup() {
+    const payload = {
+      app: "DIAFA WIFIZONE PRO", version: 1, exportedAt: new Date().toISOString(),
+      revendeurs, tarifs, catLabels, tickets, weeks, meta, activities,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
+    a.href = url; a.download = `diafa-sauvegarde-${stamp}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    const now = Date.now();
+    setLastBackup(now);
+    saveKey("diafa:lastBackupDate", now);
+    addActivity("Sauvegarde téléchargée", `${fmtInt(tickets.length)} tickets, ${fmtInt(revendeurs.length)} revendeurs`);
+    showToast("Sauvegarde téléchargée");
+  }
+
+  function handleBackupFile(file) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        if (!data || data.app !== "DIAFA WIFIZONE PRO" || !Array.isArray(data.tickets)) {
+          throw new Error("Ce fichier ne ressemble pas à une sauvegarde DIAFA WIFIZONE PRO valide.");
+        }
+        setConfirmRestore(data);
+      } catch (e) {
+        showToast(e.message || "Fichier de sauvegarde illisible", "error");
+      }
+    };
+    reader.onerror = () => showToast("Impossible de lire le fichier", "error");
+    reader.readAsText(file);
+  }
+
+  function applyRestore() {
+    const d = confirmRestore;
+    setRevendeurs(d.revendeurs || []);
+    setTarifs(d.tarifs || DEFAULT_TARIFS);
+    setCatLabels({ ...DEFAULT_CAT_LABELS, ...(d.catLabels || {}) });
+    setTickets(d.tickets || []);
+    setWeeks(d.weeks || []);
+    setMeta(d.meta || { lastImportFile: null, lastImportDate: null, lastImportCount: 0 });
+    setActivities(d.activities || []);
+    addActivity("Sauvegarde restaurée", d.exportedAt ? new Date(d.exportedAt).toLocaleString("fr-FR") : "");
+    showToast("Sauvegarde restaurée avec succès");
+    setConfirmRestore(null);
+    if (fileRef.current) fileRef.current.value = "";
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 760 }}>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        <KpiCard theme={theme} icon={ShieldCheck} color={COLORS.secondary} label="Dernière sauvegarde" value={lastBackup ? timeAgo(lastBackup) : "Aucune"} />
+        <KpiCard theme={theme} icon={Database} color={COLORS.primary} label="Taille des données" value={`${fmtInt(dataSizeKB)} Ko`} />
+        <KpiCard theme={theme} icon={Ticket} color={COLORS.accent} label="Tickets enregistrés" value={fmtInt(tickets.length)} />
+      </div>
+
+      <div className="dz-card" style={{ padding: 20 }}>
+        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 4 }}>Sauvegarde manuelle</div>
+        <div style={{ fontSize: 12, color: theme.sub, marginBottom: 16 }}>
+          Télécharge un fichier contenant toutes vos données (revendeurs, tarifs, tickets, rapports, historique) — à garder de côté pour pouvoir tout restaurer en cas de problème sur cet appareil.
+        </div>
+        <button className="dz-btn" onClick={downloadBackup}
+          style={{ background: COLORS.primary, color: "#fff", padding: "10px 18px", borderRadius: 9, fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 8 }}>
+          <Download size={15} /> Télécharger une sauvegarde
+        </button>
+      </div>
+
+      <div className="dz-card" style={{ padding: 20 }}>
+        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 4 }}>Restauration</div>
+        <div style={{ fontSize: 12, color: theme.sub, marginBottom: 16 }}>
+          Restaure toutes les données depuis un fichier de sauvegarde précédemment téléchargé. <b>Remplace entièrement</b> les données actuelles de cet appareil.
+        </div>
+        <input ref={fileRef} type="file" accept="application/json,.json" style={{ display: "none" }}
+          onChange={(e) => e.target.files[0] && handleBackupFile(e.target.files[0])} />
+        <button className="dz-btn" onClick={() => fileRef.current.click()}
+          style={{ background: "transparent", border: `1px solid ${theme.border}`, color: theme.text, padding: "10px 18px", borderRadius: 9, fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 8 }}>
+          <UploadCloud size={15} /> Choisir un fichier de sauvegarde
+        </button>
+      </div>
+
+      <div className="dz-card" style={{ padding: 18, background: dark ? "#0F172A" : "#F8FAFC" }}>
+        <div style={{ fontSize: 12, color: theme.sub, lineHeight: 1.6 }}>
+          💡 Vos données vivent uniquement dans ce navigateur (stockage local). Elles ne sont <b>pas</b> automatiquement sauvegardées ailleurs — pensez à télécharger une sauvegarde régulièrement, surtout avant de changer d'ordinateur ou de vider le cache du navigateur.
+        </div>
+      </div>
+
+      {confirmRestore && (
+        <Modal theme={theme} onClose={() => setConfirmRestore(null)} title="Restaurer cette sauvegarde ?">
+          <div style={{ fontSize: 13, color: theme.sub, marginBottom: 14, lineHeight: 1.6 }}>
+            Cette sauvegarde date du <b>{confirmRestore.exportedAt ? new Date(confirmRestore.exportedAt).toLocaleString("fr-FR") : "—"}</b> et contient :
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
+            <MiniStat label="Tickets" value={(confirmRestore.tickets || []).length} theme={theme} />
+            <MiniStat label="Revendeurs" value={(confirmRestore.revendeurs || []).length} theme={theme} />
+            <MiniStat label="Semaines clôturées" value={(confirmRestore.weeks || []).length} theme={theme} />
+          </div>
+          <div style={{ fontSize: 12.5, color: COLORS.danger, marginBottom: 16 }}>
+            ⚠ Toutes les données actuelles de cet appareil seront remplacées. Cette action est irréversible.
+          </div>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <button className="dz-btn" onClick={() => setConfirmRestore(null)} style={{ background: dark ? "#334155" : "#F1F5F9", color: theme.text, padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600 }}>Annuler</button>
+            <button className="dz-btn" onClick={applyRestore} style={{ background: COLORS.danger, color: "#fff", padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 700 }}>Oui, restaurer</button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ========================== JOURNAL ==================================== */
+function Journal({ theme, dark, activities }) {
+  const [search, setSearch] = useState("");
+  const [typeFilter, setTypeFilter] = useState("Tous");
+  const [period, setPeriod] = useState("tout");
+
+  const withType = useMemo(() => activities.map((a) => ({ ...a, ...activityType(a.text) })), [activities]);
+  const types = ["Tous", ...Array.from(new Set(withType.map((a) => a.label)))];
+
+  const now = Date.now();
+  const periodMs = { "24h": 86400000, "7j": 7 * 86400000, "30j": 30 * 86400000, tout: Infinity };
+
+  const filtered = withType.filter((a) => {
+    if (typeFilter !== "Tous" && a.label !== typeFilter) return false;
+    if (now - a.time > periodMs[period]) return false;
+    if (search && !(a.text + " " + (a.sub || "")).toLowerCase().includes(search.toLowerCase())) return false;
+    return true;
+  });
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ position: "relative", flex: "1 1 220px", maxWidth: 280 }}>
+          <Search size={14} style={{ position: "absolute", left: 11, top: 10.5 }} color={theme.sub} />
+          <input className="dz-input" style={{ paddingLeft: 32 }} placeholder="Rechercher…" value={search} onChange={(e) => setSearch(e.target.value)} />
+        </div>
+        <select className="dz-input" style={{ width: 160 }} value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
+          {types.map((t) => <option key={t}>{t}</option>)}
+        </select>
+        <select className="dz-input" style={{ width: 150 }} value={period} onChange={(e) => setPeriod(e.target.value)}>
+          <option value="24h">Dernières 24h</option>
+          <option value="7j">7 derniers jours</option>
+          <option value="30j">30 derniers jours</option>
+          <option value="tout">Tout l'historique</option>
+        </select>
+      </div>
+
+      <div className="dz-card" style={{ padding: 0, overflow: "hidden" }}>
+        {filtered.length === 0 ? (
+          <div style={{ padding: 30, textAlign: "center", color: theme.sub, fontSize: 13 }}>Aucune activité trouvée pour ces filtres.</div>
+        ) : (
+          <div>
+            {filtered.map((a, i) => (
+              <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "13px 18px", borderBottom: i < filtered.length - 1 ? `1px solid ${theme.border}` : "none" }}>
+                <span style={{ padding: "3px 9px", borderRadius: 99, fontSize: 10.5, fontWeight: 800, background: a.color + "18", color: a.color, flexShrink: 0, whiteSpace: "nowrap" }}>{a.label}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>{a.text}</div>
+                  {a.sub && <div style={{ fontSize: 11.5, color: theme.sub }}>{a.sub}</div>}
+                </div>
+                <div style={{ fontSize: 11, color: theme.sub, whiteSpace: "nowrap", textAlign: "right", flexShrink: 0 }}>
+                  <div>{new Date(a.time).toLocaleDateString("fr-FR")}</div>
+                  <div>{new Date(a.time).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      <div style={{ fontSize: 11.5, color: theme.sub }}>{fmtInt(filtered.length)} action(s) affichée(s) sur {fmtInt(activities.length)} enregistrée(s) (limite : 500 dernières).</div>
+    </div>
+  );
+}
+
+/* ========================== LOGIN ==================================== */
+function Login({ theme, dark, users, onLogin }) {
+  const [identifiant, setIdentifiant] = useState("");
+  const [motDePasse, setMotDePasse] = useState("");
+  const [error, setError] = useState("");
+  const [showPwd, setShowPwd] = useState(false);
+
+  function submit(e) {
+    e.preventDefault();
+    const user = users.find((u) => u.identifiant.toLowerCase() === identifiant.trim().toLowerCase());
+    if (!user || deobfuscate(user.motDePasse) !== motDePasse) {
+      setError("Identifiant ou mot de passe incorrect.");
+      return;
+    }
+    if ((user.statut || "Actif") !== "Actif") {
+      setError("Ce compte a été désactivé — contactez un administrateur.");
+      return;
+    }
+    setError("");
+    onLogin(user);
+  }
+
+  return (
+    <div style={{
+      minHeight: 640, height: "100%", display: "flex", alignItems: "center", justifyContent: "center",
+      background: `linear-gradient(135deg, ${COLORS.primary} 0%, #1D4ED8 100%)`, fontFamily: "Inter, 'Segoe UI', sans-serif", padding: 20,
+    }}>
+      <form onSubmit={submit} style={{ background: "#fff", borderRadius: 18, padding: 34, width: 360, maxWidth: "100%", boxShadow: "0 20px 60px rgba(0,0,0,.25)" }}>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", marginBottom: 22 }}>
+          <div style={{ width: 52, height: 52, borderRadius: 14, background: COLORS.primary + "15", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 12 }}>
+            <Wifi size={26} color={COLORS.primary} strokeWidth={2.4} />
+          </div>
+          <div style={{ fontWeight: 800, fontSize: 18, color: COLORS.textLight }}>DIAFA WIFIZONE PRO</div>
+          <div style={{ fontSize: 12, color: "#64748B", marginTop: 3 }}>Connectez-vous à votre compte</div>
+        </div>
+
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: "#64748B", marginBottom: 5 }}>Identifiant</div>
+          <input className="dz-input" autoFocus value={identifiant} onChange={(e) => setIdentifiant(e.target.value)} placeholder="admin" />
+        </div>
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: "#64748B", marginBottom: 5 }}>Mot de passe</div>
+          <div style={{ position: "relative" }}>
+            <input className="dz-input" type={showPwd ? "text" : "password"} value={motDePasse} onChange={(e) => setMotDePasse(e.target.value)} placeholder="••••••••" style={{ paddingRight: 38 }} />
+            <button type="button" className="dz-btn" onClick={() => setShowPwd((s) => !s)}
+              style={{ position: "absolute", right: 6, top: 5, background: "transparent", color: "#94A3B8", padding: 6 }}>
+              {showPwd ? <X size={14} /> : <CheckCircle2 size={14} />}
+            </button>
+          </div>
+        </div>
+
+        {error && (
+          <div style={{ display: "flex", alignItems: "center", gap: 7, background: COLORS.danger + "12", color: COLORS.danger, padding: "9px 12px", borderRadius: 9, fontSize: 12, marginBottom: 14 }}>
+            <AlertTriangle size={14} /> {error}
+          </div>
+        )}
+
+        <button type="submit" style={{ width: "100%", background: COLORS.primary, color: "#fff", padding: "11px 0", borderRadius: 10, fontWeight: 700, fontSize: 13.5, border: "none", cursor: "pointer", marginTop: 6 }}>
+          Se connecter
+        </button>
+
+        <div style={{ marginTop: 16, fontSize: 11, color: "#94A3B8", textAlign: "center", lineHeight: 1.5 }}>
+          Compte par défaut : <b>admin</b> / <b>admin123</b><br />— à changer dans Utilisateurs après la première connexion.
+        </div>
+      </form>
+    </div>
+  );
+}
+
+/* ========================== UTILISATEURS ==================================== */
+function Utilisateurs({ theme, dark, users, setUsers, revendeurs, showToast, addActivity, currentUser }) {
+  const [editing, setEditing] = useState(null);
+
+  const adminCount = users.filter((u) => u.role === "admin" && (u.statut || "Actif") === "Actif").length;
+
+  function openNew() {
+    setEditing({ id: null, nom: "", identifiant: "", motDePasse: "", role: "revendeur", statut: "Actif", revendeurId: "" });
+  }
+  function openEdit(u) {
+    setEditing({ ...u, motDePasse: "" }); // leave blank = keep current password
+  }
+
+  function save(u) {
+    if (!u.nom.trim() || !u.identifiant.trim()) { showToast("Nom et identifiant requis", "error"); return; }
+    const dupId = users.find((x) => x.id !== u.id && x.identifiant.toLowerCase() === u.identifiant.trim().toLowerCase());
+    if (dupId) { showToast("Cet identifiant est déjà utilisé", "error"); return; }
+    if (u.id) {
+      setUsers((prev) => prev.map((x) => x.id === u.id ? {
+        ...x, nom: u.nom, identifiant: u.identifiant, role: u.role, statut: u.statut, revendeurId: u.revendeurId || null,
+        motDePasse: u.motDePasse ? obfuscate(u.motDePasse) : x.motDePasse,
+      } : x));
+      addActivity("Utilisateur modifié", u.nom);
+      showToast("Utilisateur mis à jour");
+    } else {
+      if (!u.motDePasse) { showToast("Mot de passe requis pour un nouveau compte", "error"); return; }
+      setUsers((prev) => [...prev, {
+        id: uid(), nom: u.nom, identifiant: u.identifiant, role: u.role, statut: u.statut,
+        revendeurId: u.revendeurId || null, motDePasse: obfuscate(u.motDePasse),
+      }]);
+      addActivity("Utilisateur ajouté", `${u.nom} (${u.role === "admin" ? "Administrateur" : "Revendeur"})`);
+      showToast("Utilisateur créé");
+    }
+    setEditing(null);
+  }
+
+  function remove(u) {
+    if (u.role === "admin" && adminCount <= 1) { showToast("Impossible de supprimer le dernier compte administrateur", "error"); return; }
+    if (u.id === currentUser.id) { showToast("Vous ne pouvez pas supprimer votre propre compte connecté", "error"); return; }
+    setUsers((prev) => prev.filter((x) => x.id !== u.id));
+    addActivity("Utilisateur supprimé", u.nom);
+    showToast("Utilisateur supprimé");
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14, gap: 10, flexWrap: "wrap" }}>
+        <div className="dz-card" style={{ padding: "10px 16px", fontSize: 12, color: theme.sub, display: "flex", alignItems: "center", gap: 8 }}>
+          <ShieldCheck size={14} color={COLORS.secondary} />
+          Les comptes <b>Revendeur</b> n'ont accès qu'à la page Classements. Les comptes <b>Administrateur</b> ont accès à tout le logiciel.
+        </div>
+        <button className="dz-btn" onClick={openNew}
+          style={{ background: COLORS.primary, color: "#fff", padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+          <Plus size={15} /> Nouvel utilisateur
+        </button>
+      </div>
+
+      <div className="dz-card" style={{ overflowX: "auto" }}>
+        <table className="dz-table" style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead><tr><th>Nom</th><th>Identifiant</th><th>Rôle</th><th>Statut</th><th></th></tr></thead>
+          <tbody>
+            {users.map((u) => (
+              <tr key={u.id}>
+                <td style={{ fontWeight: 600 }}>{u.nom} {u.id === currentUser.id && <span style={{ fontSize: 10.5, color: theme.sub, fontWeight: 500 }}>(vous)</span>}</td>
+                <td style={{ color: theme.sub }}>{u.identifiant}</td>
+                <td>
+                  <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 9px", borderRadius: 99, background: (u.role === "admin" ? COLORS.primary : COLORS.secondary) + "18", color: u.role === "admin" ? COLORS.primary : COLORS.secondary }}>
+                    {u.role === "admin" ? "Administrateur" : "Revendeur"}
+                  </span>
+                </td>
+                <td>
+                  <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 9px", borderRadius: 99, background: (u.statut || "Actif") === "Actif" ? COLORS.secondary + "18" : theme.sub + "22", color: (u.statut || "Actif") === "Actif" ? COLORS.secondary : theme.sub }}>
+                    {u.statut || "Actif"}
+                  </span>
+                </td>
+                <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                  <button className="dz-btn" onClick={() => openEdit(u)} style={{ background: "transparent", color: theme.sub, padding: 5 }}><Pencil size={14} /></button>
+                  <button className="dz-btn" onClick={() => remove(u)} style={{ background: "transparent", color: COLORS.danger, padding: 5 }}><Trash2 size={14} /></button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {editing && (
+        <Modal theme={theme} onClose={() => setEditing(null)} title={editing.id ? "Modifier l'utilisateur" : "Nouvel utilisateur"}>
+          <Field label="Nom complet" theme={theme}><input className="dz-input" value={editing.nom} onChange={(e) => setEditing({ ...editing, nom: e.target.value })} /></Field>
+          <Field label="Identifiant" theme={theme}><input className="dz-input" value={editing.identifiant} onChange={(e) => setEditing({ ...editing, identifiant: e.target.value })} /></Field>
+          <Field label={editing.id ? "Nouveau mot de passe (laisser vide pour ne pas changer)" : "Mot de passe"} theme={theme}>
+            <input className="dz-input" type="password" value={editing.motDePasse} onChange={(e) => setEditing({ ...editing, motDePasse: e.target.value })} />
+          </Field>
+          <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ flex: 1 }}>
+              <Field label="Rôle" theme={theme}>
+                <select className="dz-input" value={editing.role} onChange={(e) => setEditing({ ...editing, role: e.target.value })}>
+                  <option value="admin">Administrateur</option>
+                  <option value="revendeur">Revendeur</option>
+                </select>
+              </Field>
+            </div>
+            <div style={{ flex: 1 }}>
+              <Field label="Statut" theme={theme}>
+                <select className="dz-input" value={editing.statut} onChange={(e) => setEditing({ ...editing, statut: e.target.value })}>
+                  <option>Actif</option><option>Inactif</option>
+                </select>
+              </Field>
+            </div>
+          </div>
+          {editing.role === "revendeur" && (
+            <Field label="Lier à un revendeur (optionnel)" theme={theme}>
+              <select className="dz-input" value={editing.revendeurId || ""} onChange={(e) => setEditing({ ...editing, revendeurId: e.target.value })}>
+                <option value="">Aucun lien spécifique</option>
+                {revendeurs.map((r) => <option key={r.id} value={r.id}>{r.nom}</option>)}
+              </select>
+            </Field>
+          )}
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 6 }}>
+            <button className="dz-btn" onClick={() => setEditing(null)} style={{ background: dark ? "#334155" : "#F1F5F9", color: theme.text, padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600 }}>Annuler</button>
+            <button className="dz-btn" onClick={() => save(editing)} style={{ background: COLORS.primary, color: "#fff", padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600 }}>Enregistrer</button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ========================== MES TICKETS ==================================== */
+function TicketsList({ theme, dark, tickets, revendeurs, catLabels, showToast, currentUser }) {
+  const isRevendeurViewer = currentUser && currentUser.role === "revendeur";
+  const L = { ...CAT_LABEL, ...(catLabels || {}) };
+
+  const [revFilter, setRevFilter] = useState(isRevendeurViewer ? (currentUser.revendeurId || "") : "tous");
+  const [search, setSearch] = useState("");
+  const [period, setPeriod] = useState("tout");
+  const [page, setPage] = useState(1);
+  const pageSize = 50;
+
+  // A revendeur account is locked to its own linked reseller — never shows anyone else's tickets.
+  if (isRevendeurViewer && !currentUser.revendeurId) {
+    return (
+      <div className="dz-card" style={{ padding: 30, textAlign: "center", color: theme.sub, fontSize: 13 }}>
+        Votre compte n'est pas encore lié à une fiche revendeur — demandez à un administrateur de faire ce lien dans <b>Utilisateurs</b> pour voir vos tickets ici.
+      </div>
+    );
+  }
+
+  const withDate = useMemo(
+    () => tickets.map((t) => ({ ...t, _d: parseMikhmonDate(t.date, t.time) })),
+    [tickets]
+  );
+
+  const now = Date.now();
+  const periodMs = { "24h": 86400000, "7j": 7 * 86400000, "30j": 30 * 86400000, tout: Infinity };
+
+  const scoped = isRevendeurViewer ? withDate.filter((t) => t.revendeurId === currentUser.revendeurId) : withDate;
+
+  const filtered = useMemo(() => {
+    return scoped
+      .filter((t) => revFilter === "tous" || t.revendeurId === revFilter || (revFilter === "none" && !t.revendeurId))
+      .filter((t) => !t._d || now - t._d.getTime() <= periodMs[period])
+      .filter((t) => !search || (t.username + " " + t.profile + " " + (t.comment || "") + " " + t.num).toLowerCase().includes(search.toLowerCase()))
+      .sort((a, b) => (b._d && a._d ? b._d - a._d : b.globalId - a.globalId));
+  }, [scoped, revFilter, period, search]);
+
+  const totalCA = filtered.reduce((s, t) => s + t.price, 0);
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const pageRows = filtered.slice((page - 1) * pageSize, page * pageSize);
+
+  useEffect(() => { setPage(1); }, [revFilter, search, period]);
+
+  function exportCSV() {
+    const rows = filtered.map((t) => ({
+      "№": t.num, Date: t.date, Heure: t.time, Username: t.username,
+      Profil: L[normalizeProfile(t.profile)] || t.profile, Revendeur: revendeurs.find((r) => r.id === t.revendeurId)?.nom || "Non assigné",
+      "Prix (GNF)": t.price,
+    }));
+    const csv = Papa.unparse(rows);
+    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const stamp = new Date().toISOString().slice(0, 10);
+    a.href = url; a.download = `diafa-tickets-${isRevendeurViewer ? "mes-ventes" : "toutes-ventes"}-${stamp}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    showToast(`${fmtInt(filtered.length)} tickets exportés en CSV`);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        <KpiCard theme={theme} icon={Ticket} color={COLORS.primary} label={isRevendeurViewer ? "Mes tickets" : "Tickets (filtre actuel)"} value={fmtInt(filtered.length)} />
+        <KpiCard theme={theme} icon={TrendingUp} color={COLORS.secondary} label={isRevendeurViewer ? "Mes ventes" : "CA (filtre actuel)"} value={GNF(totalCA)} />
+      </div>
+
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+        <div style={{ position: "relative", flex: "1 1 200px", maxWidth: 260 }}>
+          <Search size={14} style={{ position: "absolute", left: 11, top: 10.5 }} color={theme.sub} />
+          <input className="dz-input" style={{ paddingLeft: 32 }} placeholder="N° ticket, username, profil…" value={search} onChange={(e) => setSearch(e.target.value)} />
+        </div>
+        {!isRevendeurViewer && (
+          <select className="dz-input" style={{ width: 200 }} value={revFilter} onChange={(e) => setRevFilter(e.target.value)}>
+            <option value="tous">Tous les revendeurs</option>
+            {revendeurs.map((r) => <option key={r.id} value={r.id}>{r.nom}</option>)}
+            <option value="none">Non assigné</option>
+          </select>
+        )}
+        <select className="dz-input" style={{ width: 150 }} value={period} onChange={(e) => setPeriod(e.target.value)}>
+          <option value="24h">Dernières 24h</option>
+          <option value="7j">7 derniers jours</option>
+          <option value="30j">30 derniers jours</option>
+          <option value="tout">Tout l'historique</option>
+        </select>
+        <button className="dz-btn" disabled={filtered.length === 0} onClick={exportCSV}
+          style={{ background: "transparent", border: `1px solid ${theme.border}`, color: theme.text, padding: "9px 14px", borderRadius: 9, fontWeight: 700, fontSize: 12.5, display: "flex", alignItems: "center", gap: 7, opacity: filtered.length ? 1 : .5, marginLeft: "auto" }}>
+          <Download size={13} /> Exporter en CSV
+        </button>
+      </div>
+
+      <div className="dz-card" style={{ overflowX: "auto" }}>
+        {pageRows.length === 0 ? (
+          <div style={{ padding: 30, textAlign: "center", color: theme.sub, fontSize: 13 }}>Aucun ticket trouvé pour ces filtres.</div>
+        ) : (
+          <table className="dz-table" style={{ width: "100%", borderCollapse: "collapse", minWidth: 600 }}>
+            <thead>
+              <tr>
+                <th>#</th><th>Date</th><th>Heure</th><th>Username</th><th>Profil</th>
+                {!isRevendeurViewer && <th>Revendeur</th>}
+                <th style={{ textAlign: "right" }}>Prix</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pageRows.map((t) => (
+                <tr key={t.globalId}>
+                  <td style={{ fontWeight: 700 }}>№{t.num}</td>
+                  <td>{t.date}</td>
+                  <td style={{ color: theme.sub }}>{t.time}</td>
+                  <td style={{ fontWeight: 600 }}>{t.username}</td>
+                  <td>{L[normalizeProfile(t.profile)] || t.profile}</td>
+                  {!isRevendeurViewer && <td style={{ color: theme.sub }}>{revendeurs.find((r) => r.id === t.revendeurId)?.nom || "Non assigné"}</td>}
+                  <td style={{ textAlign: "right", fontWeight: 700 }}>{GNF(t.price)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {totalPages > 1 && (
+        <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 10 }}>
+          <button className="dz-btn" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}
+            style={{ background: dark ? "#1E293B" : "#fff", border: `1px solid ${theme.border}`, color: theme.text, padding: "7px 14px", borderRadius: 8, fontSize: 12.5, fontWeight: 600, opacity: page <= 1 ? .5 : 1 }}>
+            ← Précédent
+          </button>
+          <span style={{ fontSize: 12.5, color: theme.sub }}>Page {page} / {totalPages}</span>
+          <button className="dz-btn" disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}
+            style={{ background: dark ? "#1E293B" : "#fff", border: `1px solid ${theme.border}`, color: theme.text, padding: "7px 14px", borderRadius: 8, fontSize: 12.5, fontWeight: 600, opacity: page >= totalPages ? .5 : 1 }}>
+            Suivant →
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ========================== PARAMÈTRES ==================================== */
+function Parametres({ theme, dark, setDark, settings, setSettings, showToast, addActivity, catLabels, tarifs }) {
+  const [form, setForm] = useState(settings);
+  useEffect(() => setForm(settings), [settings]);
+  const dirty = JSON.stringify(form) !== JSON.stringify(settings);
+  const fileRef = useRef(null);
+
+  function handleLogo(file) {
+    if (file.size > 500 * 1024) { showToast("Logo trop volumineux (max 500 Ko)", "error"); return; }
+    const reader = new FileReader();
+    reader.onload = () => setForm({ ...form, logo: reader.result });
+    reader.readAsDataURL(file);
+  }
+
+  function save() {
+    setSettings(form);
+    addActivity("Paramètres modifiés", form.entreprise);
+    showToast("Paramètres enregistrés");
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 680 }}>
+      <div className="dz-card" style={{ padding: 20 }}>
+        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 16 }}>Entreprise</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 16 }}>
+          <div style={{ width: 64, height: 64, borderRadius: 14, background: dark ? "#0F172A" : "#F1F5F9", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", flexShrink: 0, border: `1px solid ${theme.border}` }}>
+            {form.logo ? <img src={form.logo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : <Wifi size={26} color={theme.sub} />}
+          </div>
+          <div>
+            <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => e.target.files[0] && handleLogo(e.target.files[0])} />
+            <button className="dz-btn" onClick={() => fileRef.current.click()}
+              style={{ background: "transparent", border: `1px solid ${theme.border}`, color: theme.text, padding: "8px 14px", borderRadius: 9, fontSize: 12.5, fontWeight: 600 }}>
+              Changer le logo
+            </button>
+            {form.logo && (
+              <button className="dz-btn" onClick={() => setForm({ ...form, logo: null })}
+                style={{ background: "transparent", color: COLORS.danger, padding: "8px 10px", borderRadius: 9, fontSize: 12.5, fontWeight: 600 }}>
+                Retirer
+              </button>
+            )}
+            <div style={{ fontSize: 11, color: theme.sub, marginTop: 5 }}>PNG/JPG, 500 Ko max — remplace l'icône Wifi dans le menu.</div>
+          </div>
+        </div>
+        <Field label="Nom de l'entreprise" theme={theme}><input className="dz-input" value={form.entreprise} onChange={(e) => setForm({ ...form, entreprise: e.target.value })} /></Field>
+        <div style={{ display: "flex", gap: 10 }}>
+          <div style={{ flex: 1 }}><Field label="Téléphone" theme={theme}><input className="dz-input" value={form.telephone} onChange={(e) => setForm({ ...form, telephone: e.target.value })} /></Field></div>
+          <div style={{ flex: 1 }}><Field label="Email" theme={theme}><input className="dz-input" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></Field></div>
+        </div>
+        <Field label="Adresse" theme={theme}><input className="dz-input" value={form.adresse} onChange={(e) => setForm({ ...form, adresse: e.target.value })} /></Field>
+      </div>
+
+      <div className="dz-card" style={{ padding: 20 }}>
+        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 16 }}>Préférences régionales</div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <Field label="Devise" theme={theme}>
+              <input className="dz-input" value={form.devise} onChange={(e) => setForm({ ...form, devise: e.target.value })} />
+            </Field>
+          </div>
+          <div style={{ flex: 1 }}>
+            <Field label="Langue" theme={theme}>
+              <select className="dz-input" value={form.langue} onChange={(e) => setForm({ ...form, langue: e.target.value })}>
+                <option>Français</option>
+              </select>
+            </Field>
+          </div>
+        </div>
+        <Field label="Fuseau horaire" theme={theme}><input className="dz-input" value={form.fuseauHoraire} onChange={(e) => setForm({ ...form, fuseauHoraire: e.target.value })} /></Field>
+        <div style={{ fontSize: 11, color: theme.sub, marginTop: -4 }}>
+          Note : les montants restent affichés en GNF dans les calculs pour le moment — la devise ci-dessus est informative en attendant la Phase 2 (multi-devises).
+        </div>
+      </div>
+
+      <div className="dz-card" style={{ padding: 20 }}>
+        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 4 }}>Apparence</div>
+        <div style={{ fontSize: 12, color: theme.sub, marginBottom: 14 }}>Mode sombre — identique au bouton lune/soleil en haut de l'écran.</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <button className="dz-btn" onClick={() => setDark(false)}
+            style={{ padding: "8px 16px", borderRadius: 9, fontSize: 12.5, fontWeight: 700, background: !dark ? COLORS.primary : (dark ? "#334155" : "#F1F5F9"), color: !dark ? "#fff" : theme.sub, display: "flex", alignItems: "center", gap: 6 }}>
+            <Sun size={14} /> Clair
+          </button>
+          <button className="dz-btn" onClick={() => setDark(true)}
+            style={{ padding: "8px 16px", borderRadius: 9, fontSize: 12.5, fontWeight: 700, background: dark ? COLORS.primary : "#F1F5F9", color: dark ? "#fff" : theme.sub, display: "flex", alignItems: "center", gap: 6 }}>
+            <Moon size={14} /> Sombre
+          </button>
+        </div>
+      </div>
+
+      <div className="dz-card" style={{ padding: 18, background: dark ? "#0F172A" : "#F8FAFC" }}>
+        <div style={{ fontSize: 12, color: theme.sub, lineHeight: 1.6 }}>
+          💡 Grille tarifaire et libellés des forfaits ({Object.values({ ...CAT_LABEL, ...catLabels }).slice(0, 5).join(", ")}) se gèrent dans <b>Tarifs</b>. Les préfixes Mikhmon par revendeur se gèrent dans <b>Revendeurs</b>.
+        </div>
+      </div>
+
+      <button className="dz-btn" disabled={!dirty} onClick={save}
+        style={{ background: COLORS.primary, color: "#fff", padding: "10px 18px", borderRadius: 9, fontSize: 13.5, fontWeight: 700, display: "flex", alignItems: "center", gap: 7, opacity: dirty ? 1 : .5, width: "fit-content" }}>
+        <Save size={15} /> Enregistrer les paramètres
+      </button>
+    </div>
+  );
+}
+
+/* ========================== EXPORTS ==================================== */
+function Exports({ theme, dark, tickets, revendeurs, weeks, tarifs, catLabels, settings, showToast }) {
+  const L = { ...CAT_LABEL, ...(catLabels || {}) };
+
+  function exportAllCSV() {
+    const rows = tickets.map((t) => ({
+      "№": t.num, Date: t.date, Heure: t.time, Username: t.username,
+      Profil: L[normalizeProfile(t.profile)] || t.profile,
+      Revendeur: revendeurs.find((r) => r.id === t.revendeurId)?.nom || "Non assigné",
+      "Prix (GNF)": t.price,
+    }));
+    const csv = Papa.unparse(rows);
+    downloadBlob(new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" }), `diafa-tous-les-tickets-${stamp()}.csv`);
+    showToast(`${fmtInt(rows.length)} tickets exportés en CSV`);
+  }
+
+  function exportExcel() {
+    const wb = XLSX.utils.book_new();
+
+    const ticketRows = tickets.map((t) => ({
+      "№": t.num, Date: t.date, Heure: t.time, Username: t.username,
+      Profil: L[normalizeProfile(t.profile)] || t.profile,
+      Revendeur: revendeurs.find((r) => r.id === t.revendeurId)?.nom || "Non assigné",
+      "Prix (GNF)": t.price,
+    }));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(ticketRows), "Tickets");
+
+    const revRows = revendeurs.map((r) => {
+      const revTickets = tickets.filter((t) => t.revendeurId === r.id);
+      return {
+        Nom: r.nom, Statut: r.statut || "Actif", Téléphone: r.telephone || "",
+        Codes: r.codes.join(", "), Tickets: revTickets.length,
+        "CA total (GNF)": revTickets.reduce((s, t) => s + t.price, 0),
+      };
+    });
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(revRows), "Revendeurs");
+
+    const weekRows = weeks.map((w) => ({
+      Semaine: w.weekNumber, "Ticket début": w.startTicket, "Ticket fin": w.endTicket,
+      "Date début": w.startDate, "Date fin": w.endDate, Tickets: w.totalTickets, "CA (GNF)": w.totalCA,
+    }));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(weekRows), "Rapports Hebdomadaires");
+
+    const tarifRows = Object.entries(tarifs).map(([k, v]) => ({ Forfait: L[k] || k, "Prix (GNF)": v }));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(tarifRows), "Tarifs");
+
+    XLSX.writeFile(wb, `diafa-export-complet-${stamp()}.xlsx`);
+    showToast("Export Excel généré");
+  }
+
+  function printSummary() {
+    const revRows = revendeurs.map((r) => {
+      const revTickets = tickets.filter((t) => t.revendeurId === r.id);
+      return { nom: r.nom, tickets: revTickets.length, ca: revTickets.reduce((s, t) => s + t.price, 0) };
+    }).sort((a, b) => b.ca - a.ca);
+    const totalCA = revRows.reduce((s, r) => s + r.ca, 0);
+    const totalTickets = tickets.length;
+
+    const html = `
+      <!doctype html><html><head><meta charset="utf-8"><title>DIAFA WIFIZONE PRO — Récapitulatif</title>
+      <style>
+        body{font-family:Arial,sans-serif;color:#1E293B;padding:30px;}
+        h1{color:#2563EB;font-size:20px;margin-bottom:2px;}
+        .sub{color:#64748B;font-size:12px;margin-bottom:20px;}
+        table{width:100%;border-collapse:collapse;font-size:13px;}
+        th{background:#F1F5F9;text-align:left;padding:8px 10px;font-size:11px;text-transform:uppercase;color:#475569;}
+        td{padding:8px 10px;border-bottom:1px solid #E2E8F0;}
+        tfoot td{font-weight:bold;background:#EFF6FF;color:#2563EB;}
+      </style></head><body>
+      <h1>${settings.entreprise || "DIAFA WIFIZONE PRO"} — Récapitulatif des ventes</h1>
+      <div class="sub">Généré le ${new Date().toLocaleString("fr-FR")}</div>
+      <table>
+        <thead><tr><th>Revendeur</th><th style="text-align:right">Tickets</th><th style="text-align:right">CA (GNF)</th></tr></thead>
+        <tbody>${revRows.map((r) => `<tr><td>${r.nom}</td><td style="text-align:right">${fmtInt(r.tickets)}</td><td style="text-align:right">${GNF(r.ca)}</td></tr>`).join("")}</tbody>
+        <tfoot><tr><td>TOTAL</td><td style="text-align:right">${fmtInt(totalTickets)}</td><td style="text-align:right">${GNF(totalCA)}</td></tr></tfoot>
+      </table>
+      </body></html>`;
+    const win = window.open("", "_blank");
+    if (!win) { showToast("Autorisez les fenêtres pop-up pour imprimer", "error"); return; }
+    win.document.write(html);
+    win.document.close();
+    win.focus();
+    setTimeout(() => win.print(), 300);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 720 }}>
+      <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+        <ExportCard theme={theme} dark={dark} icon={FileSpreadsheet} color={COLORS.secondary} title="Excel (.xlsx)"
+          desc="Classeur complet : tickets, revendeurs, rapports hebdomadaires et tarifs, chacun sur sa propre feuille."
+          action={exportExcel} label="Télécharger le classeur Excel" />
+        <ExportCard theme={theme} dark={dark} icon={Database} color={COLORS.primary} title="CSV brut"
+          desc="Tous les tickets importés, au format CSV — pratique pour ré-importer ailleurs ou analyser dans un tableur."
+          action={exportAllCSV} label="Télécharger le CSV" />
+        <ExportCard theme={theme} dark={dark} icon={CheckCircle2} color={COLORS.accent} title="Imprimer / PDF"
+          desc="Récapitulatif par revendeur, prêt à imprimer ou à enregistrer en PDF depuis la fenêtre d'impression du navigateur."
+          action={printSummary} label="Aperçu avant impression" />
+      </div>
+
+      <div className="dz-card" style={{ padding: 18, background: dark ? "#0F172A" : "#F8FAFC" }}>
+        <div style={{ fontSize: 12, color: theme.sub, lineHeight: 1.6 }}>
+          💡 Pour partager un rapport hebdomadaire ou le classement sur WhatsApp, utilisez plutôt le bouton <b>Exporter / Partager</b> directement dans les pages <b>Rapport Hebdomadaire</b> et <b>Classements</b> — ils génèrent une image PNG prête à envoyer.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ExportCard({ theme, dark, icon: Icon, color, title, desc, action, label }) {
+  return (
+    <div className="dz-card" style={{ flex: "1 1 220px", padding: 18, display: "flex", flexDirection: "column" }}>
+      <div style={{ width: 40, height: 40, borderRadius: 11, background: color + "18", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 12 }}>
+        <Icon size={19} color={color} />
+      </div>
+      <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 6 }}>{title}</div>
+      <div style={{ fontSize: 12, color: theme.sub, marginBottom: 16, flex: 1 }}>{desc}</div>
+      <button className="dz-btn" onClick={action}
+        style={{ background: color, color: "#fff", padding: "9px 0", borderRadius: 9, fontWeight: 700, fontSize: 12.5 }}>
+        {label}
+      </button>
+    </div>
+  );
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+function stamp() { return new Date().toISOString().slice(0, 10); }
