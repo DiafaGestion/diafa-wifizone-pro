@@ -21,7 +21,10 @@
     "papaparse": "https://esm.sh/papaparse@5.4.1",
     "xlsx": "https://esm.sh/xlsx@0.18.5",
     "lucide-react": "https://esm.sh/lucide-react@0.383.0?external=react",
-    "recharts": "https://esm.sh/recharts@2.12.7?external=react,react-dom"
+    "recharts": "https://esm.sh/recharts@2.12.7?external=react,react-dom",
+    "firebase/app": "https://esm.sh/firebase@10.12.2/app",
+    "firebase/auth": "https://esm.sh/firebase@10.12.2/auth",
+    "firebase/firestore": "https://esm.sh/firebase@10.12.2/firestore"
   }
 }
 </script>
@@ -46,7 +49,45 @@ import {
   LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, PieChart, Pie, Cell, BarChart, Bar
 } from "recharts";
+import { initializeApp, getApps } from "firebase/app";
+import {
+  getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut,
+  createUserWithEmailAndPassword,
+} from "firebase/auth";
+import { getFirestore, doc, getDoc, setDoc, onSnapshot } from "firebase/firestore";
 
+
+/* ---------------------------------------------------------------------- */
+/* Firebase — shared database so data & accounts work across every device */
+/* ---------------------------------------------------------------------- */
+const firebaseConfig = {
+  apiKey: "AIzaSyCzZyF__7Rl2oTbzdT8QBms6lT_idYct_Q",
+  authDomain: "diafa-wifizone-pro.firebaseapp.com",
+  projectId: "diafa-wifizone-pro",
+  storageBucket: "diafa-wifizone-pro.firebasestorage.app",
+  messagingSenderId: "385302279632",
+  appId: "1:385302279632:web:3e5d48665b87534fbdb5d5",
+};
+const firebaseApp = initializeApp(firebaseConfig);
+const auth = getAuth(firebaseApp);
+const db = getFirestore(firebaseApp);
+
+// A second, independent Firebase app instance — lets an admin create a brand new
+// account (createUserWithEmailAndPassword) without Firebase silently swapping the
+// admin's own active session over to the newly created user.
+function getSecondaryAuth() {
+  const name = "secondary";
+  const existing = getApps().find((a) => a.name === name);
+  const app = existing || initializeApp(firebaseConfig, name);
+  return getAuth(app);
+}
+
+// Firebase Auth needs a real-looking email; our app only ever asks people for a
+// short "identifiant". This deterministically turns one into the other.
+function identifiantToEmail(identifiant) {
+  const clean = (identifiant || "").trim().toLowerCase().replace(/[^a-z0-9._-]/g, "");
+  return `${clean}@diafawifizone.local`;
+}
 
 /* ---------------------------------------------------------------------- */
 /* DIAFA WIFIZONE PRO — Phase 1 prototype                                  */
@@ -105,21 +146,35 @@ const DEFAULT_SETTINGS = { entreprise: "DIAFA GROUP", logo: null, adresse: "", t
 /* ---- default tarifs (client's refined spec) ------------------------------ */
 const DEFAULT_TARIFS = { heure: 4000, jour: 9000, deuxJours: 18000, semaine: 29000, mois: 99000 };
 
-/* ---- persistent storage helpers ----------------------------------------- */
+/* ---- persistent storage helpers — now backed by Firestore (shared across every device) --- */
+function sanitizeForFirestore(value) {
+  // Firestore rejects `undefined`; round-trip through JSON to strip it safely.
+  return JSON.parse(JSON.stringify(value));
+}
 async function loadKey(key, fallback) {
   try {
-    const raw = window.localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : fallback;
-  } catch {
+    const snap = await getDoc(doc(db, "app_data", key));
+    return snap.exists() ? snap.data().value : fallback;
+  } catch (e) {
+    console.error("loadKey failed", key, e);
     return fallback;
   }
 }
 async function saveKey(key, value) {
   try {
-    window.localStorage.setItem(key, JSON.stringify(value));
+    await setDoc(doc(db, "app_data", key), { value: sanitizeForFirestore(value), updatedAt: Date.now() });
   } catch (e) {
-    console.error("storage save failed", key, e);
+    console.error("saveKey failed", key, e);
   }
+}
+// Live subscription — fires immediately with the current value, then again whenever
+// ANY device changes this key, so every screen stays in sync in real time.
+function subscribeKey(key, onChange) {
+  return onSnapshot(
+    doc(db, "app_data", key),
+    (snap) => { if (snap.exists()) onChange(snap.data().value); },
+    (err) => console.error("subscribeKey failed", key, err)
+  );
 }
 
 /* ---- one-time migration: Mikhmon's № resets per export, so older data (imported
@@ -165,15 +220,20 @@ function App() {
   const [meta, setMeta] = useState({ lastImportFile: null, lastImportDate: null, lastImportCount: 0 });
   const [activities, setActivities] = useState([]);
   const [users, setUsers] = useState([]);
-  const [sessionUserId, setSessionUserId] = useState(null);
+  const [authUser, setAuthUser] = useState(undefined); // undefined = still resolving, null = signed out
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [equipements, setEquipements] = useState([]);
   const [toast, setToast] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => setAuthUser(u));
+    return unsub;
+  }, []);
+
+  useEffect(() => {
     (async () => {
-      const [r, t, tk, w, m, a, cl, u, sess, settingsData, eq] = await Promise.all([
+      const [r, t, tk, w, m, a, cl, u, settingsData, eq] = await Promise.all([
         loadKey("diafa:revendeurs", seedRevendeurs()),
         loadKey("diafa:tarifs", DEFAULT_TARIFS),
         loadKey("diafa:tickets", []),
@@ -181,8 +241,7 @@ function App() {
         loadKey("diafa:meta", { lastImportFile: null, lastImportDate: null, lastImportCount: 0 }),
         loadKey("diafa:activities", []),
         loadKey("diafa:catLabels", DEFAULT_CAT_LABELS),
-        loadKey("diafa:users", seedUsers()),
-        loadKey("diafa:session", null),
+        loadKey("diafa:users", []),
         loadKey("diafa:settings", DEFAULT_SETTINGS),
         loadKey("diafa:equipements", []),
       ]);
@@ -197,11 +256,28 @@ function App() {
       setUsers(u);
       setSettings({ ...DEFAULT_SETTINGS, ...settingsData });
       setEquipements(eq);
-      // Session is only valid if that user still exists (e.g. wasn't deleted since)
-      setSessionUserId(sess && u.some((x) => x.id === sess) ? sess : null);
       setLoaded(true);
     })();
   }, []);
+
+  // Real-time sync: once the initial load is done, keep listening — any change made from
+  // another device (PC, phone, tablet) is reflected here automatically, live.
+  useEffect(() => {
+    if (!loaded) return;
+    const unsubs = [
+      subscribeKey("diafa:revendeurs", setRevendeurs),
+      subscribeKey("diafa:tarifs", setTarifs),
+      subscribeKey("diafa:catLabels", (v) => setCatLabels({ ...DEFAULT_CAT_LABELS, ...v })),
+      subscribeKey("diafa:tickets", setTickets),
+      subscribeKey("diafa:weeks", setWeeks),
+      subscribeKey("diafa:meta", setMeta),
+      subscribeKey("diafa:activities", setActivities),
+      subscribeKey("diafa:equipements", setEquipements),
+      subscribeKey("diafa:users", setUsers),
+      subscribeKey("diafa:settings", (v) => setSettings({ ...DEFAULT_SETTINGS, ...v })),
+    ];
+    return () => unsubs.forEach((u) => u());
+  }, [loaded]);
 
   useEffect(() => { if (loaded) saveKey("diafa:revendeurs", revendeurs); }, [revendeurs, loaded]);
   useEffect(() => { if (loaded) saveKey("diafa:tarifs", tarifs); }, [tarifs, loaded]);
@@ -212,7 +288,6 @@ function App() {
   useEffect(() => { if (loaded) saveKey("diafa:activities", activities); }, [activities, loaded]);
   useEffect(() => { if (loaded) saveKey("diafa:equipements", equipements); }, [equipements, loaded]);
   useEffect(() => { if (loaded) saveKey("diafa:users", users); }, [users, loaded]);
-  useEffect(() => { if (loaded) saveKey("diafa:session", sessionUserId); }, [sessionUserId, loaded]);
   useEffect(() => { if (loaded) saveKey("diafa:settings", settings); }, [settings, loaded]);
 
   useEffect(() => {
@@ -284,24 +359,23 @@ function App() {
   ];
   const PAGES = NAV.filter((n) => !n.soon);
 
-  const currentUser = users.find((u) => u.id === sessionUserId) || null;
+  const currentUser = authUser ? users.find((u) => u.id === authUser.uid) || null : null;
   const isRevendeurRole = currentUser && currentUser.role === "revendeur";
   // Revendeur accounts only ever see Classements — everything else is admin-only.
   const REVENDEUR_ALLOWED_PAGES = ["classements", "mestickets"];
   const VISIBLE_NAV = isRevendeurRole ? NAV.filter((n) => REVENDEUR_ALLOWED_PAGES.includes(n.id)) : NAV;
   const effectivePage = isRevendeurRole ? (REVENDEUR_ALLOWED_PAGES.includes(page) ? page : "classements") : page;
 
-  function login(user) {
-    setSessionUserId(user.id);
-    setPage(user.role === "revendeur" ? "classements" : "dashboard");
-    addActivity("Connexion", `${user.nom} (${user.role === "admin" ? "Administrateur" : "Revendeur"})`);
+  function onLoginSuccess(profile) {
+    setPage(profile.role === "revendeur" ? "classements" : "dashboard");
+    addActivity("Connexion", `${profile.nom} (${profile.role === "admin" ? "Administrateur" : "Revendeur"})`);
   }
-  function logout() {
+  async function logout() {
     addActivity("Déconnexion", currentUser ? currentUser.nom : "");
-    setSessionUserId(null);
+    await signOut(auth);
   }
 
-  if (!loaded) {
+  if (!loaded || authUser === undefined) {
     return (
       <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 520, background: theme.bg, fontFamily: "Inter, 'Segoe UI', sans-serif" }}>
         <div style={{ color: theme.sub, fontSize: 14 }}>Chargement de DIAFA WIFIZONE PRO…</div>
@@ -309,8 +383,15 @@ function App() {
     );
   }
 
-  if (!currentUser) {
-    return <Login theme={theme} dark={dark} users={users} onLogin={login} />;
+  // Very first launch ever, on any device: no admin account exists yet in the shared
+  // database — walk through creating the first one instead of showing a login form
+  // for an account that doesn't exist.
+  if (users.length === 0) {
+    return <SetupAdmin theme={theme} dark={dark} setUsers={setUsers} addActivity={addActivity} showToast={showToast} />;
+  }
+
+  if (!authUser || !currentUser) {
+    return <Login theme={theme} dark={dark} onLoginSuccess={onLoginSuccess} />;
   }
 
   return (
@@ -330,6 +411,7 @@ function App() {
         .dz-table tr:last-child td { border-bottom:none; }
         .dz-fade-in { animation: dzfade .25s ease; }
         @keyframes dzfade { from{opacity:0; transform:translateY(4px);} to{opacity:1; transform:none;} }
+        @keyframes dzpulse { 0%,100%{opacity:1;} 50%{opacity:.3;} }
         @media (max-width: 859px) {
           .dz-topbar-sub, .dz-user-role, .dz-fullscreen-btn { display: none !important; }
           .dz-main { padding: 14px !important; }
@@ -2451,25 +2533,36 @@ function Journal({ theme, dark, activities }) {
 }
 
 /* ========================== LOGIN ==================================== */
-function Login({ theme, dark, users, onLogin }) {
+function Login({ theme, dark, onLoginSuccess }) {
   const [identifiant, setIdentifiant] = useState("");
   const [motDePasse, setMotDePasse] = useState("");
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
   const [showPwd, setShowPwd] = useState(false);
 
-  function submit(e) {
+  async function submit(e) {
     e.preventDefault();
-    const user = users.find((u) => u.identifiant.toLowerCase() === identifiant.trim().toLowerCase());
-    if (!user || deobfuscate(user.motDePasse) !== motDePasse) {
-      setError("Identifiant ou mot de passe incorrect.");
-      return;
-    }
-    if ((user.statut || "Actif") !== "Actif") {
-      setError("Ce compte a été désactivé — contactez un administrateur.");
-      return;
-    }
+    if (!identifiant.trim() || !motDePasse) return;
+    setBusy(true);
     setError("");
-    onLogin(user);
+    try {
+      const cred = await signInWithEmailAndPassword(auth, identifiantToEmail(identifiant), motDePasse);
+      // Fetch this user's profile (role, nom, statut) to check it's active and to hand
+      // back to the app for the "Connexion" activity log entry.
+      const profiles = await loadKey("diafa:users", []);
+      const profile = profiles.find((p) => p.id === cred.user.uid);
+      if (profile && (profile.statut || "Actif") !== "Actif") {
+        await signOut(auth);
+        setError("Ce compte a été désactivé — contactez un administrateur.");
+        setBusy(false);
+        return;
+      }
+      onLoginSuccess(profile || { nom: identifiant, role: "admin" });
+    } catch (err) {
+      setError("Identifiant ou mot de passe incorrect.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -2507,13 +2600,76 @@ function Login({ theme, dark, users, onLogin }) {
           </div>
         )}
 
-        <button type="submit" style={{ width: "100%", background: COLORS.primary, color: "#fff", padding: "11px 0", borderRadius: 10, fontWeight: 700, fontSize: 13.5, border: "none", cursor: "pointer", marginTop: 6 }}>
-          Se connecter
+        <button type="submit" disabled={busy} style={{ width: "100%", background: COLORS.primary, color: "#fff", padding: "11px 0", borderRadius: 10, fontWeight: 700, fontSize: 13.5, border: "none", cursor: "pointer", marginTop: 6, opacity: busy ? .7 : 1 }}>
+          {busy ? "Connexion…" : "Se connecter"}
         </button>
 
         <div style={{ marginTop: 16, fontSize: 11, color: "#94A3B8", textAlign: "center", lineHeight: 1.5 }}>
-          Compte par défaut : <b>admin</b> / <b>admin123</b><br />— à changer dans Utilisateurs après la première connexion.
+          Votre compte fonctionne désormais sur tous vos appareils — PC, téléphone, tablette.
         </div>
+      </form>
+    </div>
+  );
+}
+
+/* ========================== SETUP ADMIN (premier lancement) =========== */
+function SetupAdmin({ theme, dark, setUsers, addActivity, showToast }) {
+  const [nom, setNom] = useState("Administrateur");
+  const [identifiant, setIdentifiant] = useState("admin");
+  const [motDePasse, setMotDePasse] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e) {
+    e.preventDefault();
+    setError("");
+    if (!nom.trim() || !identifiant.trim()) { setError("Nom et identifiant requis."); return; }
+    if (motDePasse.length < 6) { setError("Le mot de passe doit faire au moins 6 caractères."); return; }
+    if (motDePasse !== confirm) { setError("Les deux mots de passe ne correspondent pas."); return; }
+    setBusy(true);
+    try {
+      const cred = await createUserWithEmailAndPassword(auth, identifiantToEmail(identifiant), motDePasse);
+      const profile = { id: cred.user.uid, nom: nom.trim(), identifiant: identifiant.trim(), role: "admin", statut: "Actif" };
+      await saveKey("diafa:users", [profile]);
+      setUsers([profile]);
+      addActivity("Compte administrateur créé", nom.trim());
+      showToast("Compte administrateur créé — bienvenue !");
+    } catch (err) {
+      setError(err && err.code === "auth/email-already-in-use" ? "Cet identifiant est déjà pris." : "Erreur lors de la création du compte.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div style={{
+      minHeight: 640, height: "100%", display: "flex", alignItems: "center", justifyContent: "center",
+      background: `linear-gradient(135deg, ${COLORS.primary} 0%, #1D4ED8 100%)`, fontFamily: "Inter, 'Segoe UI', sans-serif", padding: 20,
+    }}>
+      <form onSubmit={submit} style={{ background: "#fff", borderRadius: 18, padding: 34, width: 380, maxWidth: "100%", boxShadow: "0 20px 60px rgba(0,0,0,.25)" }}>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", marginBottom: 20 }}>
+          <div style={{ width: 52, height: 52, borderRadius: 14, background: COLORS.primary + "15", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 12 }}>
+            <Wifi size={26} color={COLORS.primary} strokeWidth={2.4} />
+          </div>
+          <div style={{ fontWeight: 800, fontSize: 18, color: COLORS.textLight }}>DIAFA WIFIZONE PRO</div>
+          <div style={{ fontSize: 12, color: "#64748B", marginTop: 3, textAlign: "center" }}>Premier lancement — créez le compte administrateur</div>
+        </div>
+
+        <Field label="Nom complet" theme={{ sub: "#64748B" }}><input className="dz-input" value={nom} onChange={(e) => setNom(e.target.value)} /></Field>
+        <Field label="Identifiant" theme={{ sub: "#64748B" }}><input className="dz-input" value={identifiant} onChange={(e) => setIdentifiant(e.target.value)} /></Field>
+        <Field label="Mot de passe (6 caractères min.)" theme={{ sub: "#64748B" }}><input className="dz-input" type="password" value={motDePasse} onChange={(e) => setMotDePasse(e.target.value)} /></Field>
+        <Field label="Confirmer le mot de passe" theme={{ sub: "#64748B" }}><input className="dz-input" type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} /></Field>
+
+        {error && (
+          <div style={{ display: "flex", alignItems: "center", gap: 7, background: COLORS.danger + "12", color: COLORS.danger, padding: "9px 12px", borderRadius: 9, fontSize: 12, marginBottom: 14 }}>
+            <AlertTriangle size={14} /> {error}
+          </div>
+        )}
+
+        <button type="submit" disabled={busy} style={{ width: "100%", background: COLORS.primary, color: "#fff", padding: "11px 0", borderRadius: 10, fontWeight: 700, fontSize: 13.5, border: "none", cursor: "pointer", marginTop: 6, opacity: busy ? .7 : 1 }}>
+          {busy ? "Création…" : "Créer le compte et démarrer"}
+        </button>
       </form>
     </div>
   );
@@ -2525,42 +2681,61 @@ function Utilisateurs({ theme, dark, users, setUsers, revendeurs, showToast, add
 
   const adminCount = users.filter((u) => u.role === "admin" && (u.statut || "Actif") === "Actif").length;
 
+  const [busy, setBusy] = useState(false);
+
   function openNew() {
     setEditing({ id: null, nom: "", identifiant: "", motDePasse: "", role: "revendeur", statut: "Actif", revendeurId: "" });
   }
   function openEdit(u) {
-    setEditing({ ...u, motDePasse: "" }); // leave blank = keep current password
+    setEditing({ ...u });
   }
 
-  function save(u) {
+  async function save(u) {
     if (!u.nom.trim() || !u.identifiant.trim()) { showToast("Nom et identifiant requis", "error"); return; }
     const dupId = users.find((x) => x.id !== u.id && x.identifiant.toLowerCase() === u.identifiant.trim().toLowerCase());
     if (dupId) { showToast("Cet identifiant est déjà utilisé", "error"); return; }
+
     if (u.id) {
-      setUsers((prev) => prev.map((x) => x.id === u.id ? {
-        ...x, nom: u.nom, identifiant: u.identifiant, role: u.role, statut: u.statut, revendeurId: u.revendeurId || null,
-        motDePasse: u.motDePasse ? obfuscate(u.motDePasse) : x.motDePasse,
-      } : x));
+      // Editing: profile fields only. Changing another account's password isn't possible
+      // from the browser alone (would need a secure backend) — that account holder can
+      // change their own password once logged in, from a future "mon compte" screen.
+      const updated = users.map((x) => x.id === u.id ? { ...x, nom: u.nom, role: u.role, statut: u.statut, revendeurId: u.revendeurId || null } : x);
+      setUsers(updated);
+      await saveKey("diafa:users", updated);
       addActivity("Utilisateur modifié", u.nom);
       showToast("Utilisateur mis à jour");
-    } else {
-      if (!u.motDePasse) { showToast("Mot de passe requis pour un nouveau compte", "error"); return; }
-      setUsers((prev) => [...prev, {
-        id: uid(), nom: u.nom, identifiant: u.identifiant, role: u.role, statut: u.statut,
-        revendeurId: u.revendeurId || null, motDePasse: obfuscate(u.motDePasse),
-      }]);
+      setEditing(null);
+      return;
+    }
+
+    if (!u.motDePasse || u.motDePasse.length < 6) { showToast("Mot de passe requis (6 caractères minimum)", "error"); return; }
+    setBusy(true);
+    try {
+      const secondaryAuth = getSecondaryAuth();
+      const cred = await createUserWithEmailAndPassword(secondaryAuth, identifiantToEmail(u.identifiant), u.motDePasse);
+      await signOut(secondaryAuth); // don't leave the secondary instance signed in
+      const profile = { id: cred.user.uid, nom: u.nom, identifiant: u.identifiant, role: u.role, statut: u.statut, revendeurId: u.revendeurId || null };
+      const updated = [...users, profile];
+      setUsers(updated);
+      await saveKey("diafa:users", updated);
       addActivity("Utilisateur ajouté", `${u.nom} (${u.role === "admin" ? "Administrateur" : "Revendeur"})`);
       showToast("Utilisateur créé");
+      setEditing(null);
+    } catch (err) {
+      showToast(err && err.code === "auth/email-already-in-use" ? "Cet identifiant est déjà pris" : "Erreur lors de la création du compte", "error");
+    } finally {
+      setBusy(false);
     }
-    setEditing(null);
   }
 
-  function remove(u) {
+  async function remove(u) {
     if (u.role === "admin" && adminCount <= 1) { showToast("Impossible de supprimer le dernier compte administrateur", "error"); return; }
     if (u.id === currentUser.id) { showToast("Vous ne pouvez pas supprimer votre propre compte connecté", "error"); return; }
-    setUsers((prev) => prev.filter((x) => x.id !== u.id));
+    const updated = users.filter((x) => x.id !== u.id);
+    setUsers(updated);
+    await saveKey("diafa:users", updated);
     addActivity("Utilisateur supprimé", u.nom);
-    showToast("Utilisateur supprimé");
+    showToast("Utilisateur supprimé — son accès est révoqué immédiatement");
   }
 
   return (
@@ -2607,10 +2782,20 @@ function Utilisateurs({ theme, dark, users, setUsers, revendeurs, showToast, add
       {editing && (
         <Modal theme={theme} onClose={() => setEditing(null)} title={editing.id ? "Modifier l'utilisateur" : "Nouvel utilisateur"}>
           <Field label="Nom complet" theme={theme}><input className="dz-input" value={editing.nom} onChange={(e) => setEditing({ ...editing, nom: e.target.value })} /></Field>
-          <Field label="Identifiant" theme={theme}><input className="dz-input" value={editing.identifiant} onChange={(e) => setEditing({ ...editing, identifiant: e.target.value })} /></Field>
-          <Field label={editing.id ? "Nouveau mot de passe (laisser vide pour ne pas changer)" : "Mot de passe"} theme={theme}>
-            <input className="dz-input" type="password" value={editing.motDePasse} onChange={(e) => setEditing({ ...editing, motDePasse: e.target.value })} />
+          <Field label="Identifiant" theme={theme}>
+            <input className="dz-input" value={editing.identifiant} disabled={!!editing.id}
+              style={editing.id ? { opacity: .6, cursor: "not-allowed" } : undefined}
+              onChange={(e) => setEditing({ ...editing, identifiant: e.target.value })} />
           </Field>
+          {!editing.id ? (
+            <Field label="Mot de passe (6 caractères min.)" theme={theme}>
+              <input className="dz-input" type="password" value={editing.motDePasse} onChange={(e) => setEditing({ ...editing, motDePasse: e.target.value })} />
+            </Field>
+          ) : (
+            <div style={{ fontSize: 11.5, color: theme.sub, background: dark ? "#0F172A" : "#F8FAFC", padding: "8px 12px", borderRadius: 8, marginBottom: 12 }}>
+              L'identifiant et le mot de passe ne peuvent pas être changés ici — la personne devra utiliser "mot de passe oublié" (fonctionnalité à venir) ou vous pouvez supprimer ce compte et en recréer un.
+            </div>
+          )}
           <div style={{ display: "flex", gap: 10 }}>
             <div style={{ flex: 1 }}>
               <Field label="Rôle" theme={theme}>
@@ -2638,7 +2823,7 @@ function Utilisateurs({ theme, dark, users, setUsers, revendeurs, showToast, add
           )}
           <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 6 }}>
             <button className="dz-btn" onClick={() => setEditing(null)} style={{ background: dark ? "#334155" : "#F1F5F9", color: theme.text, padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600 }}>Annuler</button>
-            <button className="dz-btn" onClick={() => save(editing)} style={{ background: COLORS.primary, color: "#fff", padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600 }}>Enregistrer</button>
+            <button className="dz-btn" disabled={busy} onClick={() => save(editing)} style={{ background: COLORS.primary, color: "#fff", padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600, opacity: busy ? .6 : 1 }}>{busy ? "Création…" : "Enregistrer"}</button>
           </div>
         </Modal>
       )}
@@ -3019,6 +3204,7 @@ function downloadBlob(blob, filename) {
 }
 function stamp() { return new Date().toISOString().slice(0, 10); }
 
+
 /* ========================== RÉSEAU ==================================== */
 const DEVICE_TYPES = ["Cambium ePMP", "Cambium PMP", "Grandstream GWN7664", "Grandstream GWN7630", "Autre AP", "Routeur", "Switch"];
 
@@ -3027,12 +3213,38 @@ function normalizeDeviceUrl(address) {
   return /^https?:\/\//i.test(address) ? address : `http://${address}`;
 }
 
+// Best-effort reachability check via an image request (works around CORS, since <img> doesn't
+// need permissive headers the way fetch() does). Still approximate: a browser on HTTPS (GitHub
+// Pages) usually can't reach a plain-HTTP local device at all — that's a browser security rule,
+// not a real "down" device. Treated as "unknown" rather than falsely reporting DOWN in that case.
+function pingDevice(address, onResult) {
+  const url = normalizeDeviceUrl(address);
+  const isPageHttps = typeof window !== "undefined" && window.location.protocol === "https:";
+  const isTargetHttp = url.startsWith("http://");
+  if (isPageHttps && isTargetHttp) {
+    onResult("blocked");
+    return;
+  }
+  const img = new window.Image();
+  let done = false;
+  const finish = (status) => { if (!done) { done = true; onResult(status); } };
+  const timer = window.setTimeout(() => finish("down"), 2500);
+  img.onload = () => { window.clearTimeout(timer); finish("up"); };
+  img.onerror = () => { window.clearTimeout(timer); finish("up"); }; // an error response still means something answered
+  img.src = `${url}/favicon.ico?_=${Date.now()}`;
+}
+
+const STATUS_STYLE = {
+  up: { label: "En ligne", color: COLORS.secondary },
+  down: { label: "Hors ligne", color: COLORS.danger },
+  blocked: { label: "Non vérifiable ici", color: COLORS.accent },
+  unknown: { label: "Non vérifié", color: "#94A3B8" },
+  checking: { label: "Vérification…", color: "#94A3B8" },
+};
+
 function Reseau({ theme, dark, equipements, setEquipements, showToast, addActivity }) {
   const [editing, setEditing] = useState(null);
-  const [openDevice, setOpenDevice] = useState(null); // device being viewed in the embedded modal
-  const [frameFailed, setFrameFailed] = useState(false);
-  const [frameLoaded, setFrameLoaded] = useState(false);
-  const loadTimerRef = useRef(null);
+  const [statuses, setStatuses] = useState({}); // { [deviceId]: 'up'|'down'|'blocked'|'checking' }
 
   function openNew() {
     setEditing({ id: null, nom: "", type: DEVICE_TYPES[0], adresse: "", notes: "" });
@@ -3059,16 +3271,13 @@ function Reseau({ theme, dark, equipements, setEquipements, showToast, addActivi
     showToast("Équipement supprimé");
   }
 
-  function tryOpenEmbedded(device) {
-    setOpenDevice(device);
-    setFrameFailed(false);
-    setFrameLoaded(false);
-    // Most local device admin UIs (and the mixed-content rule when this app runs on HTTPS)
-    // block iframe embedding. Give it ~3s — if the frame never reports success, show the fallback.
-    if (loadTimerRef.current) window.clearTimeout(loadTimerRef.current);
-    loadTimerRef.current = window.setTimeout(() => {
-      setFrameFailed((already) => (frameLoaded ? already : true));
-    }, 3000);
+  function checkOne(device) {
+    setStatuses((s) => ({ ...s, [device.id]: "checking" }));
+    pingDevice(device.adresse, (status) => setStatuses((s) => ({ ...s, [device.id]: status })));
+  }
+
+  function checkAll() {
+    equipements.forEach((d) => checkOne(d));
   }
 
   return (
@@ -3076,13 +3285,20 @@ function Reseau({ theme, dark, equipements, setEquipements, showToast, addActivi
       <div className="dz-card" style={{ padding: 14, marginBottom: 14, display: "flex", alignItems: "center", gap: 10, background: COLORS.primary + "0c", border: `1px solid ${COLORS.primary}33` }}>
         <Wifi size={17} color={COLORS.primary} style={{ flexShrink: 0 }} />
         <div style={{ fontSize: 12.5, color: theme.text }}>
-          L'ouverture directe dans l'app fonctionne surtout depuis la <b>version bureau (.exe)</b> ou le fichier HTML en local sur le même réseau.
-          Depuis le site en ligne (HTTPS), le navigateur bloque souvent l'intégration des interfaces d'antennes (HTTP) pour des raisons de sécurité — un bouton "ouvrir dans un nouvel onglet" est toujours proposé en secours.
+          Le bouton "Ouvrir" lance l'interface de l'équipement dans un nouvel onglet. L'état EN LIGNE / HORS LIGNE est une estimation — depuis le site en ligne (HTTPS), le navigateur bloque souvent la vérification d'appareils locaux en HTTP ; utilisez la version bureau (.exe) pour un résultat fiable.
         </div>
       </div>
 
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14, gap: 10, flexWrap: "wrap" }}>
-        <div style={{ fontSize: 12.5, color: theme.sub, alignSelf: "center" }}>{fmtInt(equipements.length)} équipement(s) enregistré(s)</div>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <div style={{ fontSize: 12.5, color: theme.sub }}>{fmtInt(equipements.length)} équipement(s)</div>
+          {equipements.length > 0 && (
+            <button className="dz-btn" onClick={checkAll}
+              style={{ background: "transparent", border: `1px solid ${theme.border}`, color: theme.text, padding: "7px 12px", borderRadius: 8, fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", gap: 6 }}>
+              <RefreshCw size={12} /> Vérifier tous les états
+            </button>
+          )}
+        </div>
         <button className="dz-btn" onClick={openNew}
           style={{ background: COLORS.primary, color: "#fff", padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
           <Plus size={15} /> Ajouter un équipement
@@ -3095,29 +3311,41 @@ function Reseau({ theme, dark, equipements, setEquipements, showToast, addActivi
         </div>
       ) : (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 14 }}>
-          {equipements.map((d) => (
-            <div key={d.id} className="dz-card" style={{ padding: 16 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
-                <div>
-                  <div style={{ fontWeight: 700, fontSize: 14 }}>{d.nom}</div>
-                  <div style={{ fontSize: 11, color: theme.sub, marginTop: 2 }}>{d.type}</div>
+          {equipements.map((d) => {
+            const st = STATUS_STYLE[statuses[d.id] || "unknown"];
+            return (
+              <div key={d.id} className="dz-card" style={{ padding: 16 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+                  <div>
+                    <div style={{ fontWeight: 700, fontSize: 14 }}>{d.nom}</div>
+                    <div style={{ fontSize: 11, color: theme.sub, marginTop: 2 }}>{d.type}</div>
+                  </div>
+                  <Wifi size={18} color={COLORS.primary} />
                 </div>
-                <Wifi size={18} color={COLORS.primary} />
+                <div style={{ fontSize: 12.5, color: theme.text, fontFamily: "monospace", background: dark ? "#0F172A" : "#F8FAFC", padding: "5px 9px", borderRadius: 7, marginBottom: 8, display: "inline-block" }}>
+                  {d.adresse}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
+                  <span style={{
+                    width: 8, height: 8, borderRadius: 99, background: st.color, flexShrink: 0,
+                    animation: statuses[d.id] === "checking" ? "dzpulse 1s ease-in-out infinite" : "none",
+                  }} />
+                  <span style={{ fontSize: 11.5, fontWeight: 700, color: st.color }}>{st.label.toUpperCase()}</span>
+                </div>
+                {d.notes && <div style={{ fontSize: 11.5, color: theme.sub, marginBottom: 10 }}>{d.notes}</div>}
+                <div style={{ display: "flex", gap: 6 }}>
+                  <a href={normalizeDeviceUrl(d.adresse)} target="_blank" rel="noopener noreferrer"
+                    className="dz-btn" style={{ flex: 1, background: COLORS.primary, color: "#fff", padding: "8px 0", borderRadius: 8, fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, textDecoration: "none" }}>
+                    <Share2 size={13} /> Ouvrir
+                  </a>
+                  <button className="dz-btn" title="Vérifier l'état" onClick={() => checkOne(d)}
+                    style={{ background: "transparent", border: `1px solid ${theme.border}`, color: theme.sub, padding: "8px 10px", borderRadius: 8 }}><RefreshCw size={13} /></button>
+                  <button className="dz-btn" onClick={() => setEditing({ ...d })} style={{ background: "transparent", border: `1px solid ${theme.border}`, color: theme.sub, padding: "8px 10px", borderRadius: 8 }}><Pencil size={13} /></button>
+                  <button className="dz-btn" onClick={() => remove(d.id)} style={{ background: "transparent", border: `1px solid ${theme.border}`, color: COLORS.danger, padding: "8px 10px", borderRadius: 8 }}><Trash2 size={13} /></button>
+                </div>
               </div>
-              <div style={{ fontSize: 12.5, color: theme.text, fontFamily: "monospace", background: dark ? "#0F172A" : "#F8FAFC", padding: "5px 9px", borderRadius: 7, marginBottom: 8, display: "inline-block" }}>
-                {d.adresse}
-              </div>
-              {d.notes && <div style={{ fontSize: 11.5, color: theme.sub, marginBottom: 10 }}>{d.notes}</div>}
-              <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
-                <button className="dz-btn" onClick={() => tryOpenEmbedded(d)}
-                  style={{ flex: 1, background: COLORS.primary, color: "#fff", padding: "8px 0", borderRadius: 8, fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-                  <Maximize2 size={13} /> Ouvrir
-                </button>
-                <button className="dz-btn" onClick={() => setEditing({ ...d })} style={{ background: "transparent", border: `1px solid ${theme.border}`, color: theme.sub, padding: "8px 10px", borderRadius: 8 }}><Pencil size={13} /></button>
-                <button className="dz-btn" onClick={() => remove(d.id)} style={{ background: "transparent", border: `1px solid ${theme.border}`, color: COLORS.danger, padding: "8px 10px", borderRadius: 8 }}><Trash2 size={13} /></button>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -3140,52 +3368,6 @@ function Reseau({ theme, dark, equipements, setEquipements, showToast, addActivi
             <button className="dz-btn" onClick={() => save(editing)} style={{ background: COLORS.primary, color: "#fff", padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600 }}>Enregistrer</button>
           </div>
         </Modal>
-      )}
-
-      {openDevice && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,.6)", zIndex: 40, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}
-          onClick={() => setOpenDevice(null)}>
-          <div className="dz-card" style={{ width: "100%", maxWidth: 1000, height: "85%", background: theme.panel, display: "flex", flexDirection: "column", overflow: "hidden" }} onClick={(e) => e.stopPropagation()}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", borderBottom: `1px solid ${theme.border}` }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700, fontSize: 13.5 }}>
-                <Wifi size={15} color={COLORS.primary} /> {openDevice.nom} — {openDevice.adresse}
-              </div>
-              <div style={{ display: "flex", gap: 8 }}>
-                <a href={normalizeDeviceUrl(openDevice.adresse)} target="_blank" rel="noopener noreferrer"
-                  className="dz-btn" style={{ background: COLORS.primary, color: "#fff", padding: "7px 12px", borderRadius: 8, fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", gap: 6, textDecoration: "none" }}>
-                  <Share2 size={13} /> Nouvel onglet
-                </a>
-                <button className="dz-btn" onClick={() => setOpenDevice(null)} style={{ background: "transparent", color: theme.sub, padding: 7 }}><X size={16} /></button>
-              </div>
-            </div>
-            <div style={{ flex: 1, position: "relative", background: "#0F172A" }}>
-              {!frameLoaded && !frameFailed && (
-                <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#94A3B8", fontSize: 13 }}>
-                  Tentative de connexion à {openDevice.adresse}…
-                </div>
-              )}
-              {frameFailed && (
-                <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, color: "#E2E8F0", padding: 30, textAlign: "center" }}>
-                  <AlertTriangle size={28} color={COLORS.accent} />
-                  <div style={{ fontSize: 13.5, maxWidth: 420 }}>
-                    L'intégration directe est bloquée par votre navigateur pour cette interface (protocole non sécurisé ou protection anti-intégration de l'appareil).
-                  </div>
-                  <a href={normalizeDeviceUrl(openDevice.adresse)} target="_blank" rel="noopener noreferrer"
-                    style={{ background: COLORS.primary, color: "#fff", padding: "10px 18px", borderRadius: 9, fontSize: 13, fontWeight: 700, textDecoration: "none" }}>
-                    Ouvrir dans un nouvel onglet
-                  </a>
-                </div>
-              )}
-              <iframe
-                title={openDevice.nom}
-                src={normalizeDeviceUrl(openDevice.adresse)}
-                style={{ width: "100%", height: "100%", border: "none", opacity: frameFailed ? 0 : 1 }}
-                onLoad={() => { setFrameLoaded(true); if (loadTimerRef.current) window.clearTimeout(loadTimerRef.current); }}
-                onError={() => setFrameFailed(true)}
-              />
-            </div>
-          </div>
-        </div>
       )}
     </div>
   );
