@@ -167,12 +167,13 @@ function App() {
   const [users, setUsers] = useState([]);
   const [sessionUserId, setSessionUserId] = useState(null);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [equipements, setEquipements] = useState([]);
   const [toast, setToast] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
     (async () => {
-      const [r, t, tk, w, m, a, cl, u, sess, settingsData] = await Promise.all([
+      const [r, t, tk, w, m, a, cl, u, sess, settingsData, eq] = await Promise.all([
         loadKey("diafa:revendeurs", seedRevendeurs()),
         loadKey("diafa:tarifs", DEFAULT_TARIFS),
         loadKey("diafa:tickets", []),
@@ -183,6 +184,7 @@ function App() {
         loadKey("diafa:users", seedUsers()),
         loadKey("diafa:session", null),
         loadKey("diafa:settings", DEFAULT_SETTINGS),
+        loadKey("diafa:equipements", []),
       ]);
       setRevendeurs(r);
       setTarifs(t);
@@ -194,6 +196,7 @@ function App() {
       setCatLabels({ ...DEFAULT_CAT_LABELS, ...cl });
       setUsers(u);
       setSettings({ ...DEFAULT_SETTINGS, ...settingsData });
+      setEquipements(eq);
       // Session is only valid if that user still exists (e.g. wasn't deleted since)
       setSessionUserId(sess && u.some((x) => x.id === sess) ? sess : null);
       setLoaded(true);
@@ -207,6 +210,7 @@ function App() {
   useEffect(() => { if (loaded) saveKey("diafa:weeks", weeks); }, [weeks, loaded]);
   useEffect(() => { if (loaded) saveKey("diafa:meta", meta); }, [meta, loaded]);
   useEffect(() => { if (loaded) saveKey("diafa:activities", activities); }, [activities, loaded]);
+  useEffect(() => { if (loaded) saveKey("diafa:equipements", equipements); }, [equipements, loaded]);
   useEffect(() => { if (loaded) saveKey("diafa:users", users); }, [users, loaded]);
   useEffect(() => { if (loaded) saveKey("diafa:session", sessionUserId); }, [sessionUserId, loaded]);
   useEffect(() => { if (loaded) saveKey("diafa:settings", settings); }, [settings, loaded]);
@@ -274,6 +278,7 @@ function App() {
     { id: "exports", label: "Exports", icon: Database },
     { id: "utilisateurs", label: "Utilisateurs", icon: Users },
     { id: "parametres", label: "Paramètres", icon: Tag },
+    { id: "reseau", label: "Réseau", icon: Wifi },
     { id: "sauvegarde", label: "Sauvegarde", icon: ShieldCheck },
     { id: "journal", label: "Journal", icon: FileSpreadsheet },
   ];
@@ -487,6 +492,9 @@ function App() {
           {effectivePage === "stats" && (
             <Statistiques theme={theme} dark={dark} tickets={tickets} revendeurs={revendeurs} catLabels={catLabels} />
           )}
+          {effectivePage === "reseau" && (
+            <Reseau theme={theme} dark={dark} equipements={equipements} setEquipements={setEquipements} showToast={showToast} addActivity={addActivity} />
+          )}
           {effectivePage === "sauvegarde" && (
             <Sauvegarde theme={theme} dark={dark} showToast={showToast} addActivity={addActivity}
               revendeurs={revendeurs} setRevendeurs={setRevendeurs}
@@ -495,7 +503,8 @@ function App() {
               tickets={tickets} setTickets={setTickets}
               weeks={weeks} setWeeks={setWeeks}
               meta={meta} setMeta={setMeta}
-              activities={activities} setActivities={setActivities} />
+              activities={activities} setActivities={setActivities}
+              equipements={equipements} setEquipements={setEquipements} />
           )}
           {effectivePage === "journal" && (
             <Journal theme={theme} dark={dark} activities={activities} />
@@ -1104,6 +1113,13 @@ function Revendeurs({ theme, dark, revendeurs, setRevendeurs, tickets, showToast
     setRevendeurs((prev) => prev.map((r) => r.id === id ? { ...r, statut: next } : r));
     addActivity(`Revendeur ${next === "Actif" ? "réactivé" : "désactivé"}`, rev.nom);
   }
+  function freeCodes(id) {
+    const rev = revendeurs.find((r) => r.id === id);
+    if (!rev.codes.length) return;
+    setRevendeurs((prev) => prev.map((r) => r.id === id ? { ...r, codes: [] } : r));
+    addActivity("Codes libérés", `${rev.nom} — codes disponibles pour un nouveau revendeur, historique conservé`);
+    showToast(`Codes de ${rev.nom} libérés — réutilisables pour un nouveau revendeur`);
+  }
 
   return (
     <div>
@@ -1145,6 +1161,11 @@ function Revendeurs({ theme, dark, revendeurs, setRevendeurs, tickets, showToast
                 <td style={{ textAlign: "right", fontWeight: 700 }}>{GNF(caFor(r.id))}</td>
                 <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
                   <button className="dz-btn" onClick={() => setEditing({ ...r, codesInput: r.codes.join(", "), statut: r.statut || "Actif", couleur: r.couleur || COLORS.primary, observations: r.observations || "" })} style={{ background: "transparent", color: theme.sub, padding: 5 }}><Pencil size={14} /></button>
+                  {r.codes.length > 0 && (
+                    <button className="dz-btn" title="Libérer les codes (départ définitif, garde l'historique)"
+                      onClick={() => { if (window.confirm(`Libérer les codes de ${r.nom} (${r.codes.join(", ")}) ? Ils deviendront disponibles pour un nouveau revendeur. L'historique de ${r.nom} est conservé.`)) freeCodes(r.id); }}
+                      style={{ background: "transparent", color: COLORS.accent, padding: 5 }}><Tag size={14} /></button>
+                  )}
                   <button className="dz-btn" onClick={() => remove(r.id)} style={{ background: "transparent", color: COLORS.danger, padding: 5 }}><Trash2 size={14} /></button>
                 </td>
               </tr>
@@ -2239,7 +2260,7 @@ function activityType(text) {
   return { label: "Autre", color: "#64748B" };
 }
 
-function Sauvegarde({ theme, dark, showToast, addActivity, revendeurs, setRevendeurs, tarifs, setTarifs, catLabels, setCatLabels, tickets, setTickets, weeks, setWeeks, meta, setMeta, activities, setActivities }) {
+function Sauvegarde({ theme, dark, showToast, addActivity, revendeurs, setRevendeurs, tarifs, setTarifs, catLabels, setCatLabels, tickets, setTickets, weeks, setWeeks, meta, setMeta, activities, setActivities, equipements, setEquipements }) {
   const [lastBackup, setLastBackup] = useState(null);
   const [confirmRestore, setConfirmRestore] = useState(null); // parsed backup object, pending confirmation
   const fileRef = useRef(null);
@@ -2256,7 +2277,7 @@ function Sauvegarde({ theme, dark, showToast, addActivity, revendeurs, setRevend
   function downloadBackup() {
     const payload = {
       app: "DIAFA WIFIZONE PRO", version: 1, exportedAt: new Date().toISOString(),
-      revendeurs, tarifs, catLabels, tickets, weeks, meta, activities,
+      revendeurs, tarifs, catLabels, tickets, weeks, meta, activities, equipements,
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -2298,6 +2319,7 @@ function Sauvegarde({ theme, dark, showToast, addActivity, revendeurs, setRevend
     setWeeks(d.weeks || []);
     setMeta(d.meta || { lastImportFile: null, lastImportDate: null, lastImportCount: 0 });
     setActivities(d.activities || []);
+    setEquipements(d.equipements || []);
     addActivity("Sauvegarde restaurée", d.exportedAt ? new Date(d.exportedAt).toLocaleString("fr-FR") : "");
     showToast("Sauvegarde restaurée avec succès");
     setConfirmRestore(null);
@@ -2996,6 +3018,178 @@ function downloadBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 function stamp() { return new Date().toISOString().slice(0, 10); }
+
+/* ========================== RÉSEAU ==================================== */
+const DEVICE_TYPES = ["Cambium ePMP", "Cambium PMP", "Grandstream GWN7664", "Grandstream GWN7630", "Autre AP", "Routeur", "Switch"];
+
+function normalizeDeviceUrl(address) {
+  if (!address) return "";
+  return /^https?:\/\//i.test(address) ? address : `http://${address}`;
+}
+
+function Reseau({ theme, dark, equipements, setEquipements, showToast, addActivity }) {
+  const [editing, setEditing] = useState(null);
+  const [openDevice, setOpenDevice] = useState(null); // device being viewed in the embedded modal
+  const [frameFailed, setFrameFailed] = useState(false);
+  const [frameLoaded, setFrameLoaded] = useState(false);
+  const loadTimerRef = useRef(null);
+
+  function openNew() {
+    setEditing({ id: null, nom: "", type: DEVICE_TYPES[0], adresse: "", notes: "" });
+  }
+
+  function save(d) {
+    if (!d.nom.trim() || !d.adresse.trim()) { showToast("Nom et adresse IP requis", "error"); return; }
+    if (d.id) {
+      setEquipements((prev) => prev.map((x) => x.id === d.id ? { ...x, ...d } : x));
+      addActivity("Équipement modifié", d.nom);
+      showToast("Équipement mis à jour");
+    } else {
+      setEquipements((prev) => [...prev, { ...d, id: uid() }]);
+      addActivity("Équipement ajouté", `${d.nom} (${d.type})`);
+      showToast("Équipement ajouté");
+    }
+    setEditing(null);
+  }
+
+  function remove(id) {
+    const d = equipements.find((x) => x.id === id);
+    setEquipements((prev) => prev.filter((x) => x.id !== id));
+    addActivity("Équipement supprimé", d?.nom);
+    showToast("Équipement supprimé");
+  }
+
+  function tryOpenEmbedded(device) {
+    setOpenDevice(device);
+    setFrameFailed(false);
+    setFrameLoaded(false);
+    // Most local device admin UIs (and the mixed-content rule when this app runs on HTTPS)
+    // block iframe embedding. Give it ~3s — if the frame never reports success, show the fallback.
+    if (loadTimerRef.current) window.clearTimeout(loadTimerRef.current);
+    loadTimerRef.current = window.setTimeout(() => {
+      setFrameFailed((already) => (frameLoaded ? already : true));
+    }, 3000);
+  }
+
+  return (
+    <div>
+      <div className="dz-card" style={{ padding: 14, marginBottom: 14, display: "flex", alignItems: "center", gap: 10, background: COLORS.primary + "0c", border: `1px solid ${COLORS.primary}33` }}>
+        <Wifi size={17} color={COLORS.primary} style={{ flexShrink: 0 }} />
+        <div style={{ fontSize: 12.5, color: theme.text }}>
+          L'ouverture directe dans l'app fonctionne surtout depuis la <b>version bureau (.exe)</b> ou le fichier HTML en local sur le même réseau.
+          Depuis le site en ligne (HTTPS), le navigateur bloque souvent l'intégration des interfaces d'antennes (HTTP) pour des raisons de sécurité — un bouton "ouvrir dans un nouvel onglet" est toujours proposé en secours.
+        </div>
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14, gap: 10, flexWrap: "wrap" }}>
+        <div style={{ fontSize: 12.5, color: theme.sub, alignSelf: "center" }}>{fmtInt(equipements.length)} équipement(s) enregistré(s)</div>
+        <button className="dz-btn" onClick={openNew}
+          style={{ background: COLORS.primary, color: "#fff", padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+          <Plus size={15} /> Ajouter un équipement
+        </button>
+      </div>
+
+      {equipements.length === 0 ? (
+        <div className="dz-card" style={{ padding: 30, textAlign: "center", color: theme.sub, fontSize: 13 }}>
+          Aucun équipement enregistré — ajoutez vos antennes Cambium ou points d'accès Grandstream avec leur adresse IP.
+        </div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 14 }}>
+          {equipements.map((d) => (
+            <div key={d.id} className="dz-card" style={{ padding: 16 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 14 }}>{d.nom}</div>
+                  <div style={{ fontSize: 11, color: theme.sub, marginTop: 2 }}>{d.type}</div>
+                </div>
+                <Wifi size={18} color={COLORS.primary} />
+              </div>
+              <div style={{ fontSize: 12.5, color: theme.text, fontFamily: "monospace", background: dark ? "#0F172A" : "#F8FAFC", padding: "5px 9px", borderRadius: 7, marginBottom: 8, display: "inline-block" }}>
+                {d.adresse}
+              </div>
+              {d.notes && <div style={{ fontSize: 11.5, color: theme.sub, marginBottom: 10 }}>{d.notes}</div>}
+              <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+                <button className="dz-btn" onClick={() => tryOpenEmbedded(d)}
+                  style={{ flex: 1, background: COLORS.primary, color: "#fff", padding: "8px 0", borderRadius: 8, fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                  <Maximize2 size={13} /> Ouvrir
+                </button>
+                <button className="dz-btn" onClick={() => setEditing({ ...d })} style={{ background: "transparent", border: `1px solid ${theme.border}`, color: theme.sub, padding: "8px 10px", borderRadius: 8 }}><Pencil size={13} /></button>
+                <button className="dz-btn" onClick={() => remove(d.id)} style={{ background: "transparent", border: `1px solid ${theme.border}`, color: COLORS.danger, padding: "8px 10px", borderRadius: 8 }}><Trash2 size={13} /></button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {editing && (
+        <Modal theme={theme} onClose={() => setEditing(null)} title={editing.id ? "Modifier l'équipement" : "Nouvel équipement"}>
+          <Field label="Nom" theme={theme}><input className="dz-input" placeholder="Antenne Toit Nord" value={editing.nom} onChange={(e) => setEditing({ ...editing, nom: e.target.value })} /></Field>
+          <Field label="Type" theme={theme}>
+            <select className="dz-input" value={editing.type} onChange={(e) => setEditing({ ...editing, type: e.target.value })}>
+              {DEVICE_TYPES.map((t) => <option key={t}>{t}</option>)}
+            </select>
+          </Field>
+          <Field label="Adresse IP (ou URL)" theme={theme}>
+            <input className="dz-input" placeholder="192.168.1.20" value={editing.adresse} onChange={(e) => setEditing({ ...editing, adresse: e.target.value })} />
+          </Field>
+          <Field label="Notes (optionnel)" theme={theme}>
+            <textarea className="dz-input" rows={2} style={{ resize: "vertical" }} value={editing.notes} onChange={(e) => setEditing({ ...editing, notes: e.target.value })} />
+          </Field>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 6 }}>
+            <button className="dz-btn" onClick={() => setEditing(null)} style={{ background: dark ? "#334155" : "#F1F5F9", color: theme.text, padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600 }}>Annuler</button>
+            <button className="dz-btn" onClick={() => save(editing)} style={{ background: COLORS.primary, color: "#fff", padding: "9px 16px", borderRadius: 9, fontSize: 13, fontWeight: 600 }}>Enregistrer</button>
+          </div>
+        </Modal>
+      )}
+
+      {openDevice && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,.6)", zIndex: 40, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}
+          onClick={() => setOpenDevice(null)}>
+          <div className="dz-card" style={{ width: "100%", maxWidth: 1000, height: "85%", background: theme.panel, display: "flex", flexDirection: "column", overflow: "hidden" }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", borderBottom: `1px solid ${theme.border}` }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700, fontSize: 13.5 }}>
+                <Wifi size={15} color={COLORS.primary} /> {openDevice.nom} — {openDevice.adresse}
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <a href={normalizeDeviceUrl(openDevice.adresse)} target="_blank" rel="noopener noreferrer"
+                  className="dz-btn" style={{ background: COLORS.primary, color: "#fff", padding: "7px 12px", borderRadius: 8, fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", gap: 6, textDecoration: "none" }}>
+                  <Share2 size={13} /> Nouvel onglet
+                </a>
+                <button className="dz-btn" onClick={() => setOpenDevice(null)} style={{ background: "transparent", color: theme.sub, padding: 7 }}><X size={16} /></button>
+              </div>
+            </div>
+            <div style={{ flex: 1, position: "relative", background: "#0F172A" }}>
+              {!frameLoaded && !frameFailed && (
+                <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#94A3B8", fontSize: 13 }}>
+                  Tentative de connexion à {openDevice.adresse}…
+                </div>
+              )}
+              {frameFailed && (
+                <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, color: "#E2E8F0", padding: 30, textAlign: "center" }}>
+                  <AlertTriangle size={28} color={COLORS.accent} />
+                  <div style={{ fontSize: 13.5, maxWidth: 420 }}>
+                    L'intégration directe est bloquée par votre navigateur pour cette interface (protocole non sécurisé ou protection anti-intégration de l'appareil).
+                  </div>
+                  <a href={normalizeDeviceUrl(openDevice.adresse)} target="_blank" rel="noopener noreferrer"
+                    style={{ background: COLORS.primary, color: "#fff", padding: "10px 18px", borderRadius: 9, fontSize: 13, fontWeight: 700, textDecoration: "none" }}>
+                    Ouvrir dans un nouvel onglet
+                  </a>
+                </div>
+              )}
+              <iframe
+                title={openDevice.nom}
+                src={normalizeDeviceUrl(openDevice.adresse)}
+                style={{ width: "100%", height: "100%", border: "none", opacity: frameFailed ? 0 : 1 }}
+                onLoad={() => { setFrameLoaded(true); if (loadTimerRef.current) window.clearTimeout(loadTimerRef.current); }}
+                onError={() => setFrameFailed(true)}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
