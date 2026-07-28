@@ -1,7 +1,7 @@
 // Versioned cache name — bump this (the number after "v") every time a new version is
 // shipped, in lockstep with APP_VERSION in App.jsx. On activate, any cache that doesn't
 // match this exact name is deleted, so a stale version can never linger on a device.
-const CACHE_NAME = 'diafa-wifizone-pro-v3.6.6';
+const CACHE_NAME = 'diafa-wifizone-pro-v3.6.9';
 const ASSETS = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 // Never cache or interfere with Firebase/Google requests — those must always go
