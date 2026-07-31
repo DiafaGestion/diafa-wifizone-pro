@@ -1,11 +1,12 @@
-// Versioned cache name — bump this (the number after "v") every time a new version is
-// shipped, in lockstep with APP_VERSION in App.jsx. On activate, any cache that doesn't
-// match this exact name is deleted, so a stale version can never linger on a device.
-const CACHE_NAME = 'diafa-wifizone-pro-v3.9.2';
-const ASSETS = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
+// DIAFA WIFIZONE PRO — Service Worker (fast-open strategy)
+//
+// STABLE cache name (do NOT bump per app version): the heavy, content-hashed library
+// chunks are downloaded ONCE and reused across every future version, so opening the app
+// is instant even on a slow connection. Only bump the "vN" if this SW logic itself changes.
+const CACHE_NAME = 'diafa-wifizone-cache-v2';
+const APP_SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
-// Never cache or interfere with Firebase/Google requests — those must always go
-// straight to the network so data stays live and correct.
+// Firebase / Google must always go straight to the network (live data, never cached).
 const BYPASS_DOMAINS = [
   'gstatic.com', 'googleapis.com', 'firebaseio.com', 'firebasestorage.googleapis.com',
   'cdnjs.cloudflare.com', 'fonts.googleapis.com', 'fonts.gstatic.com',
@@ -13,7 +14,7 @@ const BYPASS_DOMAINS = [
 
 self.addEventListener('install', (e) => {
   self.skipWaiting();
-  e.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS)).catch(() => {}));
+  e.waitUntil(caches.open(CACHE_NAME).then((c) => c.addAll(APP_SHELL)).catch(() => {}));
 });
 
 self.addEventListener('activate', (e) => {
@@ -27,20 +28,35 @@ self.addEventListener('activate', (e) => {
 self.addEventListener('fetch', (e) => {
   const url = e.request.url;
   if (BYPASS_DOMAINS.some((d) => url.includes(d)) || e.request.method !== 'GET' || url.includes('sw.js')) {
+    return; // let the network handle it
+  }
+
+  // Content-hashed build files (…/assets/index-XXXX.js) are immutable: a given URL never
+  // changes content. CACHE-FIRST = served instantly from cache, no network wait.
+  if (url.includes('/assets/')) {
+    e.respondWith(
+      caches.match(e.request).then((cached) => cached || fetch(e.request).then((resp) => {
+        if (resp && resp.status === 200) {
+          const clone = resp.clone();
+          caches.open(CACHE_NAME).then((c) => c.put(e.request, clone));
+        }
+        return resp;
+      }).catch(() => cached))
+    );
     return;
   }
-  // Network-first: always try to get the freshest version; only fall back to the
-  // cached copy (so the app still opens) if the network genuinely fails.
+
+  // index.html / manifest / icons / navigation → NETWORK-FIRST (these are small, so it stays
+  // fast, and it lets a freshly deployed version be picked up immediately). Falls back to the
+  // cached copy when offline so the app still opens.
   e.respondWith(
-    fetch(e.request)
-      .then((response) => {
-        if (response && response.status === 200) {
-          const clone = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(e.request, clone));
-        }
-        return response;
-      })
-      .catch(() => caches.match(e.request).then((r) => r || caches.match('./index.html')))
+    fetch(e.request).then((resp) => {
+      if (resp && resp.status === 200) {
+        const clone = resp.clone();
+        caches.open(CACHE_NAME).then((c) => c.put(e.request, clone));
+      }
+      return resp;
+    }).catch(() => caches.match(e.request).then((r) => r || caches.match('./index.html')))
   );
 });
 
