@@ -9,9 +9,10 @@ ReactDOM.createRoot(document.getElementById("root")).render(
 );
 
 // Register the service worker (production only) so the app installs as a PWA
-// and opens instantly on repeat visits.
+// and opens instantly on repeat visits. BASE_URL is relative ("./") here — see
+// vite.config.js — so this resolves correctly no matter which folder/subpath serves the app.
 if ("serviceWorker" in navigator && import.meta.env.PROD) {
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("/sw.js").catch(() => {});
+    navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`).catch(() => {});
   });
 }

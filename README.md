@@ -46,6 +46,29 @@ rapide, comme dans le build `v3.9.8` d'origine).
 npm run preview   # pour tester le build localement avant déploiement
 ```
 
+## Déployer sur GitHub Pages (https://diafagestion.github.io/diafa-wifizone-pro/)
+
+Le dépôt inclut `.github/workflows/deploy.yml` : à chaque `git push` sur `main`, GitHub build
+et publie automatiquement le site — pas besoin de builder/uploader `dist/` à la main.
+
+**Étapes (une seule fois) :**
+1. Pousse ce dépôt sur `https://github.com/diafagestion/diafa-wifizone-pro` (branche `main`).
+2. Sur GitHub → onglet **Settings** du dépôt → **Pages** (menu de gauche).
+3. Sous **Build and deployment** → **Source**, choisis **GitHub Actions** (et non "Deploy from a branch").
+4. Le workflow se déclenche automatiquement (visible dans l'onglet **Actions**). Une fois vert,
+   le site est en ligne à `https://diafagestion.github.io/diafa-wifizone-pro/`.
+
+**Important** : `vite.config.js` utilise `base: "./"` (chemin relatif) — c'est ce qui permet au
+même build de fonctionner tel quel sur GitHub Pages (sous `/diafa-wifizone-pro/`), sur cPanel,
+ou dans n'importe quel sous-dossier, sans rien coder en dur. C'est exactement le même principe
+que ton ancien build qui fonctionnait (`./assets/...`, `./manifest.json`) — ne remplace pas ça
+par un chemin absolu du type `/diafa-wifizone-pro/`, ça casserait le jour où tu renommes le
+dépôt ou redéploies ailleurs.
+
+Si la page reste blanche après déploiement : ouvre la console du navigateur (F12) — une
+erreur 404 sur les fichiers `.js`/`.css` signifie presque toujours un souci de chemin de base,
+ou que GitHub Pages sert encore le code source au lieu du contenu buildé de `dist/`.
+
 ## Importer dans GitHub
 
 ```bash
